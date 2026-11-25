@@ -1,0 +1,57 @@
+task_name: qsa_sparse_attention_gqa_dpas # SparsePA selected-block GQA systolic attention (f16 / u8 / u4 paged KV cache)
+job_name: qsa_sparse_attention_gqa_dpas_ptl # A name for the job, e.g., experiment name or model name
+
+gpu_arch: ptl # Short name of the target architecture
+language: OCL # The target language
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 5
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+test_reference: true # If true will run the tests and profiling for the reference too
+
+profiler_kernel: unitrace
+profiler_reference: unitrace
+
+build_timeout: 300
+test_timeout: 1800 # 21 prefill benchmarks (3 cache types x 1K..64K) plus correctness cases
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-5-5-opus
+    temperature: 0.2
+    max_tokens: 30000
+
+# evolve mode
+evolve_mode: true
+# agentic workflow
+agentic_workflow: true
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+max_iters: 10
+branches_per_iteration: 4
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate
+use_exploration_prompts: True

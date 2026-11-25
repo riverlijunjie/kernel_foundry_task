@@ -1,0 +1,56 @@
+task_name: q80_gemv_sg # Q8_0 GEMV "SG" (sub-group block-read, SLM-prestaged, transposed layout) kernel
+job_name: q80_gemv_sg_fc_shapes # fc_gguf_q8_0_sg shapes: K2048_N512 / K2048_N4096 / K2048_N8192
+
+gpu_arch: ptl # Panther Lake / Xe3
+language: OCL
+
+test_reference: true # run tests + profiling for the reference to compute speedup
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-4-8-opus
+    temperature: 0.15
+    max_tokens: 5000
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 3
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+
+# agentic workflow
+agentic_workflow: true
+
+# Agent Skills used by the Copilot CLI agent. Paths are resolved relative to
+# the KernelFoundry repository root by AgenticController.
+skills:
+  directories:
+    - q80-gemv-optimization/SKILL.md
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+max_iters: 2
+branches_per_iteration: 2
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True

@@ -1,0 +1,99 @@
+{
+  "device": "Intel(R) Arc(TM) B580 Graphics",
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.4,
+    "fp32_tflops": 7.37,
+    "int8_tops_dp4a": 29.49,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_MiB": 16.0
+  },
+  "records": [
+    {
+      "kernel": "moe_transcode",
+      "format": "gguf_q4_k",
+      "params": {
+        "E": 256,
+        "N": 512,
+        "K": 2048,
+        "to_i4": 1,
+        "qmax": 7
+      },
+      "timing": {
+        "median_ms": 8.495260000000002,
+        "min_ms": 8.427916,
+        "mean_ms": 8.49156618,
+        "iters": 50
+      },
+      "roofline": {
+        "time_ms": 8.495260000000004,
+        "achieved_gflops": 0.0,
+        "achieved_bw_gbps": 35.54804538060046,
+        "arithmetic_intensity": 0.0,
+        "peak_compute_gflops": 7372.799999999999,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 0.0,
+        "bw_util_pct": 32.316404891454965,
+        "compute_util_pct": 0.0,
+        "roofline_pct": 0.0,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.07194387167692184,
+        "passed": true,
+        "max_code_diff": 1,
+        "code_mismatch_frac": 0.0,
+        "scale_relerr": 0.0
+      },
+      "data": {
+        "weight_MiB": 144.0,
+        "wq_MiB": 128.0,
+        "sc_MiB": 16.0
+      }
+    },
+    {
+      "kernel": "moe_transcode",
+      "format": "gguf_q5_k",
+      "params": {
+        "E": 256,
+        "N": 2048,
+        "K": 512,
+        "to_i4": 0,
+        "qmax": 127
+      },
+      "timing": {
+        "median_ms": 10.607812000000001,
+        "min_ms": 10.549375000000001,
+        "mean_ms": 10.60428912,
+        "iters": 50
+      },
+      "roofline": {
+        "time_ms": 10.607812000000001,
+        "achieved_gflops": 0.0,
+        "achieved_bw_gbps": 44.28453747106377,
+        "arithmetic_intensity": 0.0,
+        "peak_compute_gflops": 7372.799999999999,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 0.0,
+        "bw_util_pct": 40.25867042823979,
+        "compute_util_pct": 0.0,
+        "roofline_pct": 0.0,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.004418023396283388,
+        "passed": true,
+        "max_code_diff": 1,
+        "code_mismatch_frac": 0.0,
+        "scale_relerr": 0.0
+      },
+      "data": {
+        "weight_MiB": 176.0,
+        "wq_MiB": 256.0,
+        "sc_MiB": 16.0
+      }
+    }
+  ],
+  "timestamp_unix": 1783674778
+}

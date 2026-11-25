@@ -1,0 +1,55 @@
+task_name: ocl_matmul_dpas
+job_name: test_ocl_matmul_dpas_ptl
+
+gpu_arch: ptl
+language: OCL
+
+inference:
+  _target_: kernelfoundry.algorithm.inference_server.LLMEnsemble
+  servers:
+    - _target_: kernelgen.gnai_inference.BedrockInferenceServer
+    # server_type: aws_bedrock
+    model_id: us.anthropic.claude-opus-4-7
+    temperature: 0.1
+    max_tokens: 10000
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 2
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+test_reference: true
+evolve_mode: true
+
+# database:
+#   config:
+#     exploration_ratio: 0.4
+#     exploitation_ratio: 0.5
+#     # guidance_exploration_rate: 0.3
+#     num_top_programs: 2
+
+max_iters: 30
+branches_per_iteration: 3
+
+# use_feedback_llm: true
+# feedback_llm_config:
+#     model_name: "gpt-5.3-codex"
+#     temperature: 0.3 
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.2
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.4
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate
+use_exploration_prompts: True

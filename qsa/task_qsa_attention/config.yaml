@@ -1,0 +1,77 @@
+task_name: qsa_sparse_attention_gqa_dpas   # QSA (query sparse attention) GQA DPAS kernel
+job_name: qsa_gqa_dpas_opt                 # name for this optimization run
+
+gpu_arch: ptl                # PTL
+language: CM                 # C for Metal
+
+# CM kernels are compiled JIT by clops via clBuildProgram(-cmc), no AOT build step.
+has_build_step: false
+has_reference_build_step: false
+
+test_reference: true        # also run correctness + benchmark against reference.cm
+
+# Profiler selection is a runner-level setting, not a task-local setting in
+# run_agentic.yaml.  Set profiler_kernel=vtune and profiler_reference=vtune
+# in the KernelFoundry runner after its base schema declares these fields.
+
+# The kernel + its ~16K-token benchmarks (large paged KV cache, JIT compile of a
+# ~300-line DPAS kernel) need more headroom than the defaults.
+build_timeout: 300
+test_timeout: 900
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-4-8-opus
+    # model_name: gpt-5.1-codex
+    # model_name: gpt-5.6-luna
+    # model_name: claude-5-opus
+    # model_name: gpt-6-astra
+    temperature: 0.15
+    max_tokens: 10000
+
+prompt:
+  reference_language: CM
+  num_optimization_tips: 8
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+
+# agentic workflow
+agentic_workflow: true
+# The server's automatically selected CM image is unavailable:
+# amr-registry.caas.intel.com/caisp-team/kernelfoundry/cm-all.
+# Run directly in the KernelFoundry worker environment instead.
+use_container: true
+
+# Use the KernelFoundry system account/public GNAI budget, not the submitter's
+# personal budget. This requires the server to provide system_account_token.
+use_user_token_budget: false
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+max_iters: 2
+branches_per_iteration: 2
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate
+use_exploration_prompts: True

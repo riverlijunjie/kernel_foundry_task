@@ -1,0 +1,21 @@
+{
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.40,
+    "simd_fp32_lanes_per_cu": 16,
+    "fma_factor": 2,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_bytes": 16777216,
+    "int8_mac_factor": 4
+  },
+  "flush_mib": 128,
+  "iters": 50,
+  "warmup": 15,
+  "flush_l2": true,
+  "out": "results/transcode_report.json",
+  "cases": [
+    {"kernel": "transcode", "format": "gguf_q4_k", "experts": 256, "N": 512,  "K": 2048, "verify_slots": 2, "verify_rows": 48},
+    {"kernel": "transcode", "format": "gguf_q5_k", "experts": 256, "N": 2048, "K": 512,  "verify_slots": 2, "verify_rows": 48}
+  ]
+}

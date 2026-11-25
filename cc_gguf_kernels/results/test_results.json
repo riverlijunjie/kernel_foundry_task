@@ -1,0 +1,70 @@
+{
+  "device": "Intel(R) Arc(TM) B390 GPU",
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.4,
+    "fp32_tflops": 7.37,
+    "int8_tops_dp4a": 29.49,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_MiB": 16.0
+  },
+  "bench": {
+    "iters": 30,
+    "warmup": 10,
+    "flush_l2": true
+  },
+  "flush_mib": 128,
+  "timestamp_unix": 1783474885,
+  "records": [
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 4
+      },
+      "timing": {
+        "median_ms": 6.4867185,
+        "min_ms": 6.449583,
+        "mean_ms": 6.493506533333334,
+        "max_ms": 6.566041000000001,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 6.4867185,
+        "achieved_gflops": 156.80019411972324,
+        "achieved_bw_gbps": 64.38949740149815,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 58.53590672863468,
+        "compute_util_pct": 0.5316846860070912,
+        "roofline_pct": 58.53590672863468,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 6.4556765,
+        "min_ms": 6.441041,
+        "mean_ms": 6.510423166666667,
+        "max_ms": 7.890104,
+        "iters": 30
+      }
+    }
+  ]
+}

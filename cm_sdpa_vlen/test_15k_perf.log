@@ -1,0 +1,43 @@
+Base
+====================================================================================================
+SUMMARY TABLE (INT8)
+====================================================================================================
+single_token    q= 1 past=15360 cmpr=1 tile=1 | avg= 2.970ms min= 2.908ms | BW= 10.8 GB/s
+small_q         q= 3 past=15360 cmpr=1 tile=1 | avg= 3.548ms min= 3.451ms | BW= 27.0 GB/s
+small_q         q= 3 past=15360 cmpr=1 tile=2 | avg= 3.912ms min= 3.765ms | BW= 24.5 GB/s
+small_q         q= 4 past=15360 cmpr=1 tile=1 | avg= 3.919ms min= 3.770ms | BW= 32.6 GB/s
+small_q         q= 4 past=15360 cmpr=1 tile=2 | avg= 3.838ms min= 3.749ms | BW= 33.3 GB/s
+
+small_q         q= 8 past=15360 cmpr=1 tile=1 | avg= 4.992ms min= 4.855ms | BW= 51.2 GB/s
+small_q         q= 8 past=15360 cmpr=1 tile=2 | avg= 5.056ms min= 4.952ms | BW= 50.5 GB/s
+
+small_q         q=16 past=15360 cmpr=1 tile=1 | avg=10.058ms min= 8.819ms | BW= 50.8 GB/s
+small_q         q=16 past=15360 cmpr=1 tile=2 | avg=10.095ms min= 8.575ms | BW= 50.6 GB/s
+
+multi_token     q= 3 past=15360 cmpr=1 tile=0 | avg= 9.651ms min= 9.419ms | BW=  9.9 GB/s
+multi_token     q= 4 past=15360 cmpr=1 tile=0 | avg= 9.563ms min= 9.411ms | BW= 13.4 GB/s
+multi_token     q= 8 past=15360 cmpr=1 tile=0 | avg= 9.483ms min= 9.367ms | BW= 27.0 GB/s
+multi_token     q=16 past=15360 cmpr=1 tile=0 | avg=10.979ms min= 9.524ms | BW= 46.6 GB/s
+====================================================================================================
+
+optimization
+
+=== SUMMARY (INT8 Quantized KV Cache) ===
+single_token    q= 1 past=15360 cmpr=1 tile=1 | avg= 3.261ms min= 3.216ms | BW=  9.8 GB/s
+
+small_q         q= 3 past=15360 cmpr=1 tile=1 | avg= 3.762ms min= 3.592ms | BW= 25.5 GB/s
+small_q         q= 3 past=15360 cmpr=1 tile=2 | avg= 4.040ms min= 3.844ms | BW= 23.7 GB/s
+
+small_q         q= 4 past=15360 cmpr=1 tile=1 | avg= 4.062ms min= 3.919ms | BW= 31.5 GB/s
+small_q         q= 4 past=15360 cmpr=1 tile=2 | avg= 3.997ms min= 3.952ms | BW= 32.0 GB/s
+small_q         q= 4 past=15360 cmpr=1 tile=4 | avg= 4.036ms min= 3.845ms | BW= 31.7 GB/s
+
+small_q         q= 8 past=15360 cmpr=1 tile=1 | avg= 5.019ms min= 4.920ms | BW= 50.9 GB/s
+small_q         q= 8 past=15360 cmpr=1 tile=2 | avg= 5.251ms min= 5.022ms | BW= 48.7 GB/s
+small_q         q= 8 past=15360 cmpr=1 tile=4 | avg= 5.040ms min= 4.928ms | BW= 50.7 GB/s
+small_q         q= 8 past=15360 cmpr=1 tile=8 | avg= 4.820ms min= 4.595ms | BW= 53.0 GB/s
+
+small_q         q=16 past=15360 cmpr=1 tile=1 | avg= 8.857ms min= 7.366ms | BW= 57.7 GB/s
+small_q         q=16 past=15360 cmpr=1 tile=2 | avg= 8.978ms min= 7.537ms | BW= 56.9 GB/s
+small_q         q=16 past=15360 cmpr=1 tile=4 | avg= 8.713ms min= 7.599ms | BW= 58.7 GB/s
+small_q         q=16 past=15360 cmpr=1 tile=8 | avg= 7.727ms min= 6.676ms | BW= 66.2 GB/s

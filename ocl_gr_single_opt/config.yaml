@@ -1,0 +1,56 @@
+task_name: gr_read_dpas # GatedResidual READ / MIX single systolic kernel (f16 weights, write gate)
+job_name: gr_read_dpas_ptl # A name for the job, e.g., experiment name or model name
+
+gpu_arch: ptl # Short name of the target architecture
+language: OCL # The target language
+
+prompt:
+  reference_language: OCL
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+test_reference: true # If true will run the tests and profiling for the reference too
+
+profiler_kernel: unitrace
+profiler_reference: unitrace
+
+build_timeout: 300
+test_timeout: 1200 # 5 benchmarks (2K..64K token rows) plus the correctness cases
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-5-5-opus
+    temperature: 0.2
+    max_tokens: 30000
+
+# evolve mode
+evolve_mode: true
+# agentic workflow
+agentic_workflow: true
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+max_iters: 10
+branches_per_iteration: 8
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate
+use_exploration_prompts: True

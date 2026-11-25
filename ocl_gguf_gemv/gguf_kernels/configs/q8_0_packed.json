@@ -1,0 +1,23 @@
+{
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.40,
+    "simd_fp32_lanes_per_cu": 16,
+    "fma_factor": 2,
+    "peak_bw_gbps": 105.0,
+    "l2_cache_bytes": 16777216,
+    "int8_mac_factor": 4
+  },
+  "flush_mib": 128,
+  "iters": 500,
+  "warmup": 200,
+  "flush_l2": true,
+  "out": "results/q8_0_packed_report.json",
+  "cases": [
+    {"kernel": "dp4a_q8_0_packed", "format": "gguf_q8_0", "K": 2048, "N": 8192, "M": 1, "out_dt": "f16"},
+    {"kernel": "dp4a_q8_0_packed", "format": "gguf_q8_0", "K": 4096, "N": 2048, "M": 1, "out_dt": "f16"},
+    {"kernel": "dp4a_q8_0_packed", "format": "gguf_q8_0", "K": 2048, "N": 4096, "M": 1, "out_dt": "f16"},
+    {"kernel": "dp4a_q8_0_packed", "format": "gguf_q8_0", "K": 2048, "N": 512, "M": 1, "out_dt": "f16"}
+  ]
+}

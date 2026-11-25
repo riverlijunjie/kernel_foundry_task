@@ -1,0 +1,330 @@
+/*
+ * moe_gemv_q6k_sg.cl — High-performance Q6_K MoE GEMV with Intel sub-group
+ *                      block reads (transposed "SG" weight layout).
+ *
+ * SG counterpart of moe_gemv_q6k_shuffle.cl, built on the same transposed
+ * layout + block-read strategy as gemv_q6k_sg.cl.
+ *
+ * == Transposed ("SG") per-expert layout — SAME total size as original ==
+ * Identical to pack_q6k_sg().  nbpr = K/256, nrg = N/OPG:
+ *   pql_T:  num_blocks * 128 bytes (low nibbles)
+ *     Entry (h,bid) at (h*nbpr+bid)*OPG*128, sub-block j at j*OPG*16,
+ *     chunk c(0..3) at j*OPG*16 + c*OPG*4.
+ *   pqh_T:  num_blocks * 64 bytes  (upper 2 bits)
+ *     Entry (h,bid) at (h*nbpr+bid)*OPG*64, sub-block j at j*OPG*8,
+ *     chunk c(0..1) at j*OPG*8 + c*OPG*4.
+ *   ps_T:   num_blocks * 16 bytes  (int8 scales, si at si*OPG)
+ *   pd_T:   num_blocks * 2  bytes  (fp16 super-scale, 1 ushort/lane)
+ *   expert_size = num_blocks * 210  (128+64+16+2) — unchanged.
+ *
+ * == Dispatch == (identical to moe_gemv_q4k_sg.cl)
+ *   group_up_gate_q6k_sg: global=(output_len,KSPLIT,output_num*token_len)
+ *   down_merge_q6k_sg   : global=(output_len,KSPLIT,token_len)
+ *   local=(OPG=16,KSPLIT,1)
+ */
+
+#pragma OPENCL EXTENSION cl_khr_fp16        : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+
+#define OPG 16
+
+#ifndef KSPLIT
+#define KSPLIT 1
+#endif
+
+#define unroll_for __attribute__((opencl_unroll_hint)) for
+
+/* Accumulate one ql uint (4 positions, low+high nibble weights) into the two
+ * sub-block dot products and activation sums, applying the upper 2 bits from
+ * the qh words. */
+#define Q6_CHUNK(qlw, in, k0, s0, s1, s2, s3, qh_lo, qh_hi,                    \
+                 dot_lo, dot_hi, isum_lo, isum_hi)                            \
+    do {                                                                      \
+        uint _q = (qlw);                                                      \
+        uint _b0 =  _q        & 0xFFu;                                        \
+        uint _b1 = (_q >>  8) & 0xFFu;                                        \
+        uint _b2 = (_q >> 16) & 0xFFu;                                        \
+        uint _b3 = (_q >> 24) & 0xFFu;                                        \
+        float _l0 = (in)[(k0) + 0];  float _h0 = (in)[16 + (k0) + 0];         \
+        float _l1 = (in)[(k0) + 1];  float _h1 = (in)[16 + (k0) + 1];         \
+        float _l2 = (in)[(k0) + 2];  float _h2 = (in)[16 + (k0) + 2];         \
+        float _l3 = (in)[(k0) + 3];  float _h3 = (in)[16 + (k0) + 3];         \
+        (dot_lo) = fma(_l0, (float)((_b0 & 0xFu) | ((((qh_lo) >> (s0)) & 3u) << 4)), (dot_lo)); \
+        (dot_lo) = fma(_l1, (float)((_b1 & 0xFu) | ((((qh_lo) >> (s1)) & 3u) << 4)), (dot_lo)); \
+        (dot_lo) = fma(_l2, (float)((_b2 & 0xFu) | ((((qh_lo) >> (s2)) & 3u) << 4)), (dot_lo)); \
+        (dot_lo) = fma(_l3, (float)((_b3 & 0xFu) | ((((qh_lo) >> (s3)) & 3u) << 4)), (dot_lo)); \
+        (dot_hi) = fma(_h0, (float)(((_b0 >> 4) & 0xFu) | ((((qh_hi) >> (s0)) & 3u) << 4)), (dot_hi)); \
+        (dot_hi) = fma(_h1, (float)(((_b1 >> 4) & 0xFu) | ((((qh_hi) >> (s1)) & 3u) << 4)), (dot_hi)); \
+        (dot_hi) = fma(_h2, (float)(((_b2 >> 4) & 0xFu) | ((((qh_hi) >> (s2)) & 3u) << 4)), (dot_hi)); \
+        (dot_hi) = fma(_h3, (float)(((_b3 >> 4) & 0xFu) | ((((qh_hi) >> (s3)) & 3u) << 4)), (dot_hi)); \
+        (isum_lo) += _l0 + _l1 + _l2 + _l3;                                   \
+        (isum_hi) += _h0 + _h1 + _h2 + _h3;                                   \
+    } while (0)
+
+/* Process one full sub-block j (32 weights) from its 4 ql words + 2 qh words. */
+#define Q6_SUBBLOCK(in, ql0, ql1, ql2, ql3, qh_lo, qh_hi, clo, chi, acc)      \
+    do {                                                                      \
+        float _dl = 0.0f, _dh = 0.0f, _sl = 0.0f, _sh_ = 0.0f;                \
+        Q6_CHUNK(ql0, in,  0,  0,  8, 16, 24, qh_lo, qh_hi, _dl, _dh, _sl, _sh_); \
+        Q6_CHUNK(ql1, in,  4,  2, 10, 18, 26, qh_lo, qh_hi, _dl, _dh, _sl, _sh_); \
+        Q6_CHUNK(ql2, in,  8,  4, 12, 20, 28, qh_lo, qh_hi, _dl, _dh, _sl, _sh_); \
+        Q6_CHUNK(ql3, in, 12,  6, 14, 22, 30, qh_lo, qh_hi, _dl, _dh, _sl, _sh_); \
+        (acc) = fma((clo), _dl - 32.0f * _sl, (acc));                         \
+        (acc) = fma((chi), _dh - 32.0f * _sh_, (acc));                        \
+    } while (0)
+
+inline float q6k_acc(uint8 w0, uint8 w1, uint8 w2, uint8 w3,
+                     uint8 hq0, uint8 hq1,
+                     const float *clo, const float *chi,
+                     __local const float *sb)
+{
+    float acc = 0.0f;
+    __local const float *in;
+    in = sb + 0*32; Q6_SUBBLOCK(in, w0.s0, w0.s1, w0.s2, w0.s3, hq0.s0, hq0.s1, clo[0], chi[0], acc);
+    in = sb + 1*32; Q6_SUBBLOCK(in, w0.s4, w0.s5, w0.s6, w0.s7, hq0.s2, hq0.s3, clo[1], chi[1], acc);
+    in = sb + 2*32; Q6_SUBBLOCK(in, w1.s0, w1.s1, w1.s2, w1.s3, hq0.s4, hq0.s5, clo[2], chi[2], acc);
+    in = sb + 3*32; Q6_SUBBLOCK(in, w1.s4, w1.s5, w1.s6, w1.s7, hq0.s6, hq0.s7, clo[3], chi[3], acc);
+    in = sb + 4*32; Q6_SUBBLOCK(in, w2.s0, w2.s1, w2.s2, w2.s3, hq1.s0, hq1.s1, clo[4], chi[4], acc);
+    in = sb + 5*32; Q6_SUBBLOCK(in, w2.s4, w2.s5, w2.s6, w2.s7, hq1.s2, hq1.s3, clo[5], chi[5], acc);
+    in = sb + 6*32; Q6_SUBBLOCK(in, w3.s0, w3.s1, w3.s2, w3.s3, hq1.s4, hq1.s5, clo[6], chi[6], acc);
+    in = sb + 7*32; Q6_SUBBLOCK(in, w3.s4, w3.s5, w3.s6, w3.s7, hq1.s6, hq1.s7, clo[7], chi[7], acc);
+    return acc;
+}
+
+inline void q6k_decode(uchar16 scq, ushort d_raw, float *clo, float *chi)
+{
+    float d = (float)as_half(d_raw);
+    char sc[16];
+    sc[ 0]=as_char(scq.s0); sc[ 1]=as_char(scq.s1); sc[ 2]=as_char(scq.s2); sc[ 3]=as_char(scq.s3);
+    sc[ 4]=as_char(scq.s4); sc[ 5]=as_char(scq.s5); sc[ 6]=as_char(scq.s6); sc[ 7]=as_char(scq.s7);
+    sc[ 8]=as_char(scq.s8); sc[ 9]=as_char(scq.s9); sc[10]=as_char(scq.sa); sc[11]=as_char(scq.sb);
+    sc[12]=as_char(scq.sc); sc[13]=as_char(scq.sd); sc[14]=as_char(scq.se); sc[15]=as_char(scq.sf);
+    unroll_for (int j = 0; j < 8; j++) {
+        clo[j] = d * (float)sc[2*j];
+        chi[j] = d * (float)sc[2*j + 1];
+    }
+}
+
+/* Load 256 half activations into SLM (sb[n] = (float)activation_half[n]) via
+ * 2 sub-group block reads of 8 ushorts each (intel_sub_group_block_read_us8).
+ * Each us8 read pulls 128 contiguous fp16 values (256 B) with all 16 lanes
+ * participating, matching the wide-transaction strategy used for the weights. */
+inline void load_inp_f16(__local float *sb, const __global half *src, uint hh)
+{
+    const __global ushort *u = (const __global ushort *)src;
+    ushort8 i0 = intel_sub_group_block_read_us8(u +   0);
+    ushort8 i1 = intel_sub_group_block_read_us8(u + 128);
+    sb[ 0*OPG + hh] = (float)as_half(i0.s0); sb[ 1*OPG + hh] = (float)as_half(i0.s1);
+    sb[ 2*OPG + hh] = (float)as_half(i0.s2); sb[ 3*OPG + hh] = (float)as_half(i0.s3);
+    sb[ 4*OPG + hh] = (float)as_half(i0.s4); sb[ 5*OPG + hh] = (float)as_half(i0.s5);
+    sb[ 6*OPG + hh] = (float)as_half(i0.s6); sb[ 7*OPG + hh] = (float)as_half(i0.s7);
+    sb[ 8*OPG + hh] = (float)as_half(i1.s0); sb[ 9*OPG + hh] = (float)as_half(i1.s1);
+    sb[10*OPG + hh] = (float)as_half(i1.s2); sb[11*OPG + hh] = (float)as_half(i1.s3);
+    sb[12*OPG + hh] = (float)as_half(i1.s4); sb[13*OPG + hh] = (float)as_half(i1.s5);
+    sb[14*OPG + hh] = (float)as_half(i1.s6); sb[15*OPG + hh] = (float)as_half(i1.s7);
+}
+
+/* =======================================================================
+ * Kernel 1: group_up_gate_q6k_sg
+ * ===================================================================== */
+__attribute__((intel_reqd_sub_group_size(OPG)))
+__kernel void group_up_gate_q6k_sg(
+    __global const half   * restrict inputs,
+    __global const uchar  * restrict ups,
+    __global const uchar  * restrict gates,
+    __global const uint   * restrict indexes,
+    __global       float  * restrict outputs,
+    uint output_num,
+    uint aligned_output_num,
+    uint token_len,
+    uint input_len,
+    uint output_len
+) {
+    const uint nbpr       = input_len / 256;
+    const uint num_blocks = input_len * output_len / 256;
+    const uint expert_size = num_blocks * 210;  /* 128 ql + 64 qh + 16 ps + 2 pd */
+
+    const uint h  = get_group_id(0);
+    const uint hh = get_local_id(0);
+    const uint sg = get_local_id(1);
+    const uint vt = get_group_id(2);
+    const uint v  = vt % output_num;
+    const uint t  = vt / output_num;
+
+    const uint index = indexes ? indexes[t * aligned_output_num + v] : v;
+
+    __local float slm_inp [KSPLIT * 2 * 256];
+    __local float slm_up  [KSPLIT * OPG];
+    __local float slm_gate[KSPLIT * OPG];
+    __local float *sbase = slm_inp + sg * (2 * 256);
+
+    const __global uchar *up_pql = ups   + (size_t)index * expert_size;
+    const __global uchar *up_pqh = up_pql + (size_t)num_blocks * 128;
+    const __global uchar *up_ps  = up_pqh + (size_t)num_blocks * 64;
+    const __global uchar *up_pd  = up_ps  + (size_t)num_blocks * 16;
+    const __global uchar *gt_pql = gates + (size_t)index * expert_size;
+    const __global uchar *gt_pqh = gt_pql + (size_t)num_blocks * 128;
+    const __global uchar *gt_ps  = gt_pqh + (size_t)num_blocks * 64;
+    const __global uchar *gt_pd  = gt_ps  + (size_t)num_blocks * 16;
+
+    const __global uint   *up_pql_u = (const __global uint   *)up_pql;
+    const __global uint   *up_pqh_u = (const __global uint   *)up_pqh;
+    const __global uint   *gt_pql_u = (const __global uint   *)gt_pql;
+    const __global uint   *gt_pqh_u = (const __global uint   *)gt_pqh;
+
+    float up_acc = 0.0f, gate_acc = 0.0f;
+
+    for (uint bid = sg; bid < nbpr; bid += KSPLIT) {
+        __local float *sb = sbase + (bid & 1u) * 256;
+
+        const uint pql_e = (h * nbpr + bid) * (OPG * 128 / 4);
+        const uint pqh_e = (h * nbpr + bid) * (OPG * 64 / 4);
+        const uint ps_e  = (h * nbpr + bid) * (OPG * 16);
+        const uint pd_e  = (h * nbpr + bid) * (OPG * 2);
+
+        uint8 uw0 = intel_sub_group_block_read8(up_pql_u + pql_e +   0);
+        uint8 uw1 = intel_sub_group_block_read8(up_pql_u + pql_e + 128);
+        uint8 uw2 = intel_sub_group_block_read8(up_pql_u + pql_e + 256);
+        uint8 uw3 = intel_sub_group_block_read8(up_pql_u + pql_e + 384);
+        uint8 uhq0 = intel_sub_group_block_read8(up_pqh_u + pqh_e +   0);
+        uint8 uhq1 = intel_sub_group_block_read8(up_pqh_u + pqh_e + 128);
+        uchar16 uscq = intel_sub_group_block_read_uc16(up_ps + ps_e);
+        ushort  ud   = intel_sub_group_block_read_us((const __global ushort *)(up_pd + pd_e));
+
+        uint8 gw0 = intel_sub_group_block_read8(gt_pql_u + pql_e +   0);
+        uint8 gw1 = intel_sub_group_block_read8(gt_pql_u + pql_e + 128);
+        uint8 gw2 = intel_sub_group_block_read8(gt_pql_u + pql_e + 256);
+        uint8 gw3 = intel_sub_group_block_read8(gt_pql_u + pql_e + 384);
+        uint8 ghq0 = intel_sub_group_block_read8(gt_pqh_u + pqh_e +   0);
+        uint8 ghq1 = intel_sub_group_block_read8(gt_pqh_u + pqh_e + 128);
+        uchar16 gscq = intel_sub_group_block_read_uc16(gt_ps + ps_e);
+        ushort  gd   = intel_sub_group_block_read_us((const __global ushort *)(gt_pd + pd_e));
+
+        load_inp_f16(sb, inputs + (size_t)t * input_len + (size_t)bid * 256, hh);
+
+        float uclo[8], uchi[8], gclo[8], gchi[8];
+        q6k_decode(uscq, ud, uclo, uchi);
+        q6k_decode(gscq, gd, gclo, gchi);
+
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+        up_acc   += q6k_acc(uw0, uw1, uw2, uw3, uhq0, uhq1, uclo, uchi, sb);
+        gate_acc += q6k_acc(gw0, gw1, gw2, gw3, ghq0, ghq1, gclo, gchi, sb);
+    }
+
+#if KSPLIT == 1
+    {
+        float g   = gate_acc;
+        float sig = 1.0f / (1.0f + exp(-g));
+        outputs[(size_t)t * output_num * output_len + (size_t)v * output_len
+                + h * OPG + hh] = (sig * g) * up_acc;
+    }
+#else
+    slm_up  [sg * OPG + hh] = up_acc;
+    slm_gate[sg * OPG + hh] = gate_acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float u = 0.0f, gt = 0.0f;
+        unroll_for (int r = 0; r < KSPLIT; r++) {
+            u  += slm_up  [r * OPG + hh];
+            gt += slm_gate[r * OPG + hh];
+        }
+        float sig = 1.0f / (1.0f + exp(-gt));
+        outputs[(size_t)t * output_num * output_len + (size_t)v * output_len
+                + h * OPG + hh] = (sig * gt) * u;
+    }
+#endif
+}
+
+/* =======================================================================
+ * Kernel 2: down_merge_q6k_sg
+ * ===================================================================== */
+__attribute__((intel_reqd_sub_group_size(OPG)))
+__kernel void down_merge_q6k_sg(
+    __global const half   * restrict inputs,
+    __global const uchar  * restrict downs,
+    __global const uint   * restrict indexes,
+    __global const float  * restrict efficients,
+    __global       float  * restrict outputs,
+    uint input_num,
+    uint aligned_input_num,
+    uint token_len,
+    uint input_len,
+    uint output_len,
+    int  is_acc
+) {
+    const uint nbpr       = input_len / 256;
+    const uint num_blocks = input_len * output_len / 256;
+    const uint expert_size = num_blocks * 210;
+
+    const uint h  = get_group_id(0);
+    const uint hh = get_local_id(0);
+    const uint sg = get_local_id(1);
+    const uint t  = get_group_id(2);
+
+    __local float slm_inp[KSPLIT * 2 * 256];
+    __local float slm_red[KSPLIT * OPG];
+    __local float *sbase = slm_inp + sg * (2 * 256);
+
+    const uint total = input_num * nbpr;
+    float acc = 0.0f;
+
+    for (uint idx = sg; idx < total; idx += KSPLIT) {
+        const uint e   = idx / nbpr;
+        const uint bid = idx % nbpr;
+        __local float *sb = sbase + (idx & 1u) * 256;
+
+        const uint index     = indexes ? indexes[t * aligned_input_num + e] : e;
+        const float efficient = efficients[t * aligned_input_num + e];
+
+        const __global uchar *d_pql = downs + (size_t)index * expert_size;
+        const __global uchar *d_pqh = d_pql + (size_t)num_blocks * 128;
+        const __global uchar *d_ps  = d_pqh + (size_t)num_blocks * 64;
+        const __global uchar *d_pd  = d_ps  + (size_t)num_blocks * 16;
+        const __global uint   *d_pql_u = (const __global uint   *)d_pql;
+        const __global uint   *d_pqh_u = (const __global uint   *)d_pqh;
+
+        const uint pql_e = (h * nbpr + bid) * (OPG * 128 / 4);
+        const uint pqh_e = (h * nbpr + bid) * (OPG * 64 / 4);
+        const uint ps_e  = (h * nbpr + bid) * (OPG * 16);
+        const uint pd_e  = (h * nbpr + bid) * (OPG * 2);
+
+        uint8 w0 = intel_sub_group_block_read8(d_pql_u + pql_e +   0);
+        uint8 w1 = intel_sub_group_block_read8(d_pql_u + pql_e + 128);
+        uint8 w2 = intel_sub_group_block_read8(d_pql_u + pql_e + 256);
+        uint8 w3 = intel_sub_group_block_read8(d_pql_u + pql_e + 384);
+        uint8 hq0 = intel_sub_group_block_read8(d_pqh_u + pqh_e +   0);
+        uint8 hq1 = intel_sub_group_block_read8(d_pqh_u + pqh_e + 128);
+        uchar16 scq = intel_sub_group_block_read_uc16(d_ps + ps_e);
+        ushort  dd  = intel_sub_group_block_read_us((const __global ushort *)(d_pd + pd_e));
+
+        load_inp_f16(sb, inputs + (size_t)t * input_num * input_len
+                     + (size_t)e * input_len + (size_t)bid * 256, hh);
+
+        float clo[8], chi[8];
+        q6k_decode(scq, dd, clo, chi);
+
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+        acc += q6k_acc(w0, w1, w2, w3, hq0, hq1, clo, chi, sb) * efficient;
+    }
+
+#if KSPLIT == 1
+    {
+        uint row = h * OPG + hh;
+        float o = acc;
+        if (is_acc) o += outputs[(size_t)t * output_len + row];
+        outputs[(size_t)t * output_len + row] = o;
+    }
+#else
+    slm_red[sg * OPG + hh] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float o = 0.0f;
+        unroll_for (int r = 0; r < KSPLIT; r++) o += slm_red[r * OPG + hh];
+        uint row = h * OPG + hh;
+        if (is_acc) o += outputs[(size_t)t * output_len + row];
+        outputs[(size_t)t * output_len + row] = o;
+    }
+#endif
+}

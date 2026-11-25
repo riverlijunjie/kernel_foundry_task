@@ -1,0 +1,126 @@
+{
+  "device": "Intel(R) Arc(TM) B580 Graphics",
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.4,
+    "fp32_tflops": 7.37,
+    "int8_tops_dp4a": 29.49,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_MiB": 16.0
+  },
+  "records": [
+    {
+      "kernel": "moe_gate_up",
+      "format": "gguf_q4_k",
+      "params": {
+        "H": 2048,
+        "I": 512,
+        "E": 256,
+        "topk": 8
+      },
+      "timing": {
+        "median_ms": 0.06682249999999999,
+        "min_ms": 0.059062,
+        "mean_ms": 0.06663916,
+        "iters": 50
+      },
+      "roofline": {
+        "time_ms": 0.06682249999999999,
+        "achieved_gflops": 502.1427213887538,
+        "achieved_bw_gbps": 141.4115305473456,
+        "arithmetic_intensity": 3.5509319462505418,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 390.6025140875596,
+        "bw_util_pct": 128.55593686122327,
+        "compute_util_pct": 1.7026866366534892,
+        "roofline_pct": 128.55593686122324,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.0005395865067150924,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 9.0,
+        "read_experts": 8
+      }
+    },
+    {
+      "kernel": "moe_down",
+      "format": "gguf_q5_k",
+      "params": {
+        "H": 2048,
+        "I": 512,
+        "E": 256,
+        "topk": 8
+      },
+      "timing": {
+        "median_ms": 0.039687,
+        "min_ms": 0.037604,
+        "mean_ms": 0.039643340000000006,
+        "iters": 50
+      },
+      "roofline": {
+        "time_ms": 0.039687,
+        "achieved_gflops": 422.7383274119989,
+        "achieved_bw_gbps": 146.34877919721822,
+        "arithmetic_intensity": 2.8885675010812406,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 317.74242511893647,
+        "bw_util_pct": 133.04434472474384,
+        "compute_util_pct": 1.433438881469723,
+        "roofline_pct": 133.04434472474384,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.000235987808368993,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 5.5,
+        "read_experts": 8
+      }
+    },
+    {
+      "kernel": "moe_down",
+      "format": "gguf_q6_k",
+      "params": {
+        "H": 2048,
+        "I": 512,
+        "E": 256,
+        "topk": 8
+      },
+      "timing": {
+        "median_ms": 0.061458000000000006,
+        "min_ms": 0.059895000000000004,
+        "mean_ms": 0.06152662000000001,
+        "iters": 50
+      },
+      "roofline": {
+        "time_ms": 0.061458000000000006,
+        "achieved_gflops": 272.9866900973022,
+        "achieved_bw_gbps": 112.63392886198703,
+        "arithmetic_intensity": 2.4236630370214565,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 266.6029340723602,
+        "bw_util_pct": 102.39448078362457,
+        "compute_util_pct": 0.9256547380143982,
+        "roofline_pct": 102.39448078362459,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00023861758888323641,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 6.5625,
+        "read_experts": 8
+      }
+    }
+  ],
+  "timestamp_unix": 1783490728
+}

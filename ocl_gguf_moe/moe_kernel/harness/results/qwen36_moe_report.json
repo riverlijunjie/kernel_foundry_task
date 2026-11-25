@@ -1,0 +1,14 @@
+{
+  "device": "Intel(R) UHD Graphics 630 [0x3e92]",
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.4,
+    "fp32_tflops": 7.37,
+    "int8_tops_dp4a": 29.49,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_MiB": 16.0
+  },
+  "records": [],
+  "timestamp_unix": 1783412834
+}

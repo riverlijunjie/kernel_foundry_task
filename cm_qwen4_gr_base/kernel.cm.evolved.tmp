@@ -1,0 +1,568 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+// [USER_INSTRUCTIONS_START]
+// Gated Residual (hyper-connection) READ as ONE systolic (cm_dpas) kernel, extracted from
+// OpenVINO intel_gpu impls/cm/gated_residual/gr_read_dpas.cm. The kernel body is unchanged; the
+// helpers it needs from qsa_gr_common.hpp / qsa_dpas_common.hpp are inlined (unused ones dropped)
+// so the file is standalone.
+//
+// One work-group owns GR_RD_TM token rows:
+//   phase 1  inv_rms[row, c] of the branch-wise RMSNorm                      -> SLM
+//   phase 2  t = SiLU(Rbar @ W_down^T / C) (+ write gate S as an extra tile) -> SLM
+//   phase 3  mixed = (1/C) sum_c sigmoid(t @ W_up^T)[c] * Rbar[c]            -> global
+// Rbar is never materialized: the dpas A operand of phase 2 is the RAW residual scaled by the
+// gain in registers, and inv_rms is applied to the accumulator once per branch.
+// t lives in SLM directly in dpas A-tile layout: slot (m, kb) = 8 tokens x 16 l halfs.
+//
+// JIT constants (pinned by task.py): KERNEL_NAME, GR_BRANCHES, GR_HIDDEN, GR_LOWRANK, GR_EPS,
+// GR_NORM_GAIN_PLUS_ONE, GR_PRODUCE_WRITE_GATE, GR_WG_SIZE, GR_RD_TM, GR_RD_NT.
+//
+// Dispatch: gws = [GR_WG_SIZE, ceil(num_rows / GR_RD_TM), 1], lws = [GR_WG_SIZE, 1, 1].
+//
+// Everything outside the marked block is fixed. The kernel signature, argument order, dispatch
+// contract and output semantics must stay unchanged.
+// Optimization tips:
+//   1. merge phase 1 into phase 2
+//   2. In phase 3, the re-read of residual first uses the hardware counter to see whether it is returned to DRAM, and then decides whether to widen the read or adjust the traversal order
+// [USER_INSTRUCTIONS_END]
+
+#include <cm/cm.h>
+#include <cm/cmtl.h>
+
+#ifndef ATTR
+#define ATTR [[type("svmptr_t")]]
+#endif
+
+// dpas tile geometry (Xe2: 512-bit GRF -> N = 16).
+#define QSA_SYSTOLIC_DEPTH 8
+#define QSA_VNNI_WIDTH     2
+#define QSA_REG_K          (QSA_SYSTOLIC_DEPTH * QSA_VNNI_WIDTH)
+#define QSA_REG_M          8
+#define QSA_REG_N          (CM_GRF_WIDTH / 32)
+
+// [EVOLVE_START]
+### Block: kernel.cm ###
+namespace qsa_gr {
+
+constexpr float LOG2E = 1.4426950408889634f;
+
+CM_INLINE vector<half, 16> load_h16(const half* p [[type("svmptr_t")]], uint elem_off) {
+    vector<half, 16> v;
+    v.format<int>() = cm_ptr_load<int, 8>((int*)p, elem_off * (uint)sizeof(half));
+    return v;
+}
+
+CM_INLINE void store_h16(half* p [[type("svmptr_t")]], uint elem_off, vector<half, 16> v) {
+    cm_ptr_store<int, 8>((int*)p, elem_off * (uint)sizeof(half), v.format<int>());
+}
+
+template <int N>
+CM_INLINE void load_hv(vector_ref<half, N> dst, const half* p [[type("svmptr_t")]], uint elem_off) {
+    static_assert(N % 16 == 0, "wide half load expects a multiple of 16 elements");
+    const uint byte_off = elem_off * (uint)sizeof(half);
+    if constexpr (N == 16 || N == 32 || N == 64 || N == 128) {
+        dst.template format<int>() = cm_ptr_load<int, N / 2>((int*)p, byte_off);
+    } else if constexpr (N == 96) {
+        dst.template select<64, 1>(0).template format<int>() = cm_ptr_load<int, 32>((int*)p, byte_off);
+        dst.template select<32, 1>(64).template format<int>() = cm_ptr_load<int, 16>((int*)p, byte_off + 32 * (uint)sizeof(int));
+    } else if constexpr (N % 128 == 0) {
+#pragma unroll
+        for (int i = 0; i < N / 128; i++) {
+            dst.template select<128, 1>(i * 128).template format<int>() = cm_ptr_load<int, 64>((int*)p, byte_off + i * 64 * (uint)sizeof(int));
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < N / 16; i++) {
+            dst.template select<16, 1>(i * 16).template format<int>() = cm_ptr_load<int, 8>((int*)p, byte_off + i * 8 * (uint)sizeof(int));
+        }
+    }
+}
+
+template <int N>
+CM_INLINE vector<float, N> sigmoid(vector<float, N> x) {
+    // cm_exp is exp2, hence the log2(e) rescaling of the exponent.
+    return 1.0f / (1.0f + cm_exp(-x * LOG2E));
+}
+
+}  // namespace qsa_gr
+
+namespace qsa_dpas {
+
+// Token-major GEMM K32 step: dst[token][n] += A[token][k] * W[n][k] over 32 k.
+// A comes in TML-row messages holding two K16 slices each ([2][TML][16] halfs);
+// W tile j comes from rows y0 + j * y_stride through a transposed d32 load, one per
+// K16 slice ([8][16] uints each). acc row (j * MT + m) is the [8 tokens][16 n] tile.
+constexpr uint TOKEN_GEMM_K = 2 * QSA_REG_K;
+
+template <int TML, int NL>
+CM_INLINE void token_gemm_load_a(matrix_ref<half, NL, 2 * TML * QSA_REG_K> a, lsc::block_2d_desc<half, 2, TML, QSA_REG_K>& desc, uint y0, uint k) {
+    desc.set_block_x(k);
+#pragma unroll
+    for (int i = 0; i < NL; ++i) {
+        cm_load<lsc::Normal>(a.row(i), desc.set_block_y(y0 + i * TML));
+    }
+}
+
+template <int NB>
+CM_INLINE void token_gemm_load_b(matrix_ref<uint, 2 * NB, QSA_REG_K / 2 * QSA_REG_N> b,
+                                 lsc::block_2d_desc<uint, 1, QSA_REG_N, QSA_REG_K / 2>& desc,
+                                 uint y0,
+                                 uint y_stride,
+                                 uint k) {
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        desc.set_block_y(y0 + j * y_stride);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            cm_load<lsc::Transpose>(b.row(2 * j + h), desc.set_block_x((k + h * QSA_REG_K) / 2));
+        }
+    }
+}
+
+template <int TML, int NL, int MT, int NB>
+CM_INLINE void token_gemm_mma(matrix_ref<float, NB * MT, 8 * QSA_REG_N> acc,
+                              matrix_ref<half, NL, 2 * TML * QSA_REG_K> a,
+                              matrix_ref<uint, 2 * NB, QSA_REG_K / 2 * QSA_REG_N> b) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            const int li = (m * 8) / TML;
+            const int off = h * TML * QSA_REG_K + ((m * 8) % TML) * QSA_REG_K;
+#pragma unroll
+            for (int j = 0; j < NB; ++j) {
+                acc.row(j * MT + m) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, QSA_SYSTOLIC_DEPTH, 8, float>(
+                    acc.row(j * MT + m),
+                    b.row(2 * j + h).template format<int32_t>(),
+                    a.row(li).template select<8 * QSA_REG_K, 1>(off).template format<int32_t>());
+            }
+        }
+    }
+}
+
+}  // namespace qsa_dpas
+
+extern "C" _GENX_MAIN_ void KERNEL_NAME(const half* residual ATTR,      // [num_rows, C*D]
+                                        const half* norm_weight ATTR,   // [C*D]
+                                        const half* w_down ATTR,        // [L, C*D]
+                                        const half* w_up ATTR,          // [C*D, L]
+#if GR_PRODUCE_WRITE_GATE
+                                        const half* w_inject ATTR,      // [C, C*D]
+#endif
+                                        half* mixed ATTR,               // [num_rows, D]
+#if GR_PRODUCE_WRITE_GATE
+                                        half* write_gate ATTR,          // [num_rows, C]
+#endif
+                                        uint32_t num_rows) {
+    constexpr uint C = GR_BRANCHES;
+    constexpr uint D = GR_HIDDEN;
+    constexpr uint CD = C * D;
+    constexpr uint L = GR_LOWRANK;
+    constexpr uint WG = GR_WG_SIZE;
+    constexpr uint TM = GR_RD_TM;
+    constexpr uint MT = TM / 8;
+    constexpr uint TML = TM < 32 ? TM : 32;
+    constexpr uint NL = TM / TML;
+    constexpr uint NT = GR_RD_NT;
+    constexpr uint KB = L / QSA_REG_K;  // K16 blocks of the up projection
+    constexpr uint TILE = 8 * QSA_REG_N;
+    constexpr uint TASKS = KB / NT + (GR_PRODUCE_WRITE_GATE ? 1 : 0);
+    constexpr uint KD = (D % 128 == 0) ? 128 : 32;
+    static_assert(QSA_REG_N == 16, "GR DPAS requires 512-bit GRFs (Xe2+)");
+    static_assert(D % 32 == 0, "GR_HIDDEN must be a multiple of 32 (K32 steps stay inside one branch)");
+    static_assert(L % 32 == 0, "GR_LOWRANK must be a multiple of 32 (64B W_up surface)");
+    static_assert(TM == 8 || TM == 16 || TM == 32, "GR_RD_TM must be 8, 16 or 32");
+    static_assert(KB % NT == 0, "GR_RD_NT must divide L/16");
+    static_assert(C % 2 == 0 && C <= QSA_REG_N, "write gate is one N16 tile stored in half pairs");
+
+    const uint tid = cm_local_id(0);
+    const uint t0 = cm_group_id(1) * TM;
+    const uint z = cm_group_id(2);
+    const uint nz = cm_group_count(2);
+    if (t0 >= num_rows) {
+        return;
+    }
+
+    constexpr uint INV_BYTES = C * TM * (uint)sizeof(float);
+    constexpr uint SLOT_BYTES = TILE * (uint)sizeof(half);
+    constexpr uint T_BYTES = MT * KB * SLOT_BYTES;
+    cm_slm_init(INV_BYTES + T_BYTES);
+    auto slm_inv = cm_slm_alloc(INV_BYTES);
+    auto slm_t = cm_slm_alloc(T_BYTES);
+
+    // ------------------------------------------------------------------
+    // Phase 1+2 fusion (kernel fusion): compute inv_rms from the same residual A-tiles
+    // we already load for the DPAS down-projection, eliminating the extra Phase-1
+    // residual sweep. inv_rms is still written to SLM (single writer) for Phase 3.
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Phase 2: down projection, NT low-rank tiles (or the write-gate tile) per task.
+    //   acc += inv_rms[:, c] * ((R[:, c] * gain[c]) @ W[:, c]^T)   per branch c
+    // ------------------------------------------------------------------
+    constexpr uint cd_bytes = CD * (uint)sizeof(half);
+    constexpr float inv_d = 1.0f / (float)D;
+    lsc::block_2d_desc<half, 2, TML, QSA_REG_K> desc_a(const_cast<half*>(residual), num_rows - 1, cd_bytes - 1, cd_bytes - 1, 0, 0);
+    for (uint task = tid; task < TASKS; task += WG) {
+#if GR_PRODUCE_WRITE_GATE
+        const bool is_wgate = task == TASKS - 1;
+        const half* w = is_wgate ? w_inject : w_down;
+        const uint w_rows = is_wgate ? C : L;
+        const uint n0 = is_wgate ? 0 : task * NT * QSA_REG_N;
+#else
+        const half* w = w_down;
+        const uint w_rows = L;
+        const uint n0 = task * NT * QSA_REG_N;
+#endif
+        lsc::block_2d_desc<uint, 1, QSA_REG_N, QSA_REG_K / 2> desc_b(reinterpret_cast<uint*>(const_cast<half*>(w)),
+                                                                     w_rows - 1,
+                                                                     cd_bytes - 1,
+                                                                     cd_bytes - 1,
+                                                                     0,
+                                                                     0);
+
+        // Single writer publishes inv_rms to SLM for Phase 3 (no races).
+        const bool publish_inv = (tid == 0) && (task == 0);
+
+        matrix<float, NT * MT, TILE> acc = 0.0f;
+        for (uint c = 0; c < C; c++) {
+            matrix<float, TM, 16> sq = 0.0f;  // RMS partial sums over D (single pass)
+            matrix<float, NT * MT, TILE> accc = 0.0f;
+            for (uint k = c * D; k < (c + 1) * D; k += qsa_dpas::TOKEN_GEMM_K) {
+                vector<half, 32> g;
+                qsa_gr::load_hv<32>(g, norm_weight, k);
+#if GR_NORM_GAIN_PLUS_ONE
+                g = g + half(1.0f);
+#endif
+                matrix<half, NL, 2 * TML * QSA_REG_K> a;
+                qsa_dpas::token_gemm_load_a<TML, NL>(a, desc_a, t0, k);
+
+                // Online RMS accumulation from raw residual (before gain scaling).
+#pragma unroll
+                for (uint i = 0; i < NL; i++) {
+#pragma unroll
+                    for (uint h = 0; h < 2; h++) {
+                        vector<half, TML * QSA_REG_K> blk = a.row(i).select<TML * QSA_REG_K, 1>(h * TML * QSA_REG_K);
+                        matrix<float, TML, QSA_REG_K> f = blk;
+                        sq.template select<TML, 1, QSA_REG_K, 1>(i * TML, 0) += f * f;
+                    }
+                }
+
+                matrix<uint, 2 * NT, QSA_REG_K / 2 * QSA_REG_N> b;
+                qsa_dpas::token_gemm_load_b<NT>(b, desc_b, n0, QSA_REG_N, k);
+
+                // Gain scaling (Rbar = residual * gain). inv_rms is applied to the accumulator.
+#pragma unroll
+                for (uint i = 0; i < NL; i++) {
+#pragma unroll
+                    for (uint h = 0; h < 2; h++) {
+                        auto blk = a.row(i).select<TML * QSA_REG_K, 1>(h * TML * QSA_REG_K);
+                        blk = blk * g.select<16, 1>(h * 16).replicate<TML>();
+                    }
+                }
+                qsa_dpas::token_gemm_mma<TML, NL, MT, NT>(accc, a, b);
+            }
+
+            vector<float, TM> inv = 0.0f;
+#pragma unroll
+            for (uint t = 0; t < TM; t++) {
+                if (t0 + t < num_rows) {
+                    inv[t] = cm_rsqrt(cm_sum<float>(sq.row(t)) * inv_d + (float)GR_EPS);
+                }
+            }
+            if (publish_inv) {
+                cm_slm_block_write(slm_inv, c * TM * (uint)sizeof(float), inv);
+            }
+
+            // Apply inv_rms once per branch (vectorized broadcast over the N16 lanes).
+#pragma unroll
+            for (uint m = 0; m < MT; m++) {
+                const vector<float, 8> inv8 = inv.select<8, 1>(m * 8);
+                vector<float, TILE> inv_rep;
+#pragma unroll
+                for (uint r = 0; r < 8; r++) {
+                    inv_rep.select<16, 1>(r * 16) = inv8[r];
+                }
+#pragma unroll
+                for (uint j = 0; j < NT; j++) {
+                    acc.row(j * MT + m) += accc.row(j * MT + m) * inv_rep;
+                }
+            }
+        }
+
+        constexpr float inv_c = 1.0f / (float)C;
+#if GR_PRODUCE_WRITE_GATE
+        if (is_wgate) {
+            if (z == 0) {
+#pragma unroll
+                for (uint m = 0; m < MT; m++) {
+#pragma unroll
+                    for (uint r = 0; r < 8; r++) {
+                        const uint tok = t0 + m * 8 + r;
+                        if (tok < num_rows) {
+                            vector<float, C> x = acc.row(m).select<C, 1>(r * 16) * inv_c;
+                            // Write-gate range is (0, 2) - it must not be clamped to (0, 1).
+                            vector<half, C> s = 2.0f * qsa_gr::sigmoid<C>(x);
+                            cm_ptr_store<int, C / 2>((int*)write_gate, tok * C * (uint)sizeof(half), s.format<int>());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif
+#pragma unroll
+        for (uint j = 0; j < NT; j++) {
+#pragma unroll
+            for (uint m = 0; m < MT; m++) {
+                vector<float, TILE> x = acc.row(j * MT + m) * inv_c;
+                vector<half, TILE> t = x * qsa_gr::sigmoid<TILE>(x);  // SiLU
+                const uint slot = (m * KB + n0 / QSA_REG_N + j) * SLOT_BYTES;
+                cm_slm_block_write(slm_t, slot, t.select<TILE / 2, 1>(0));
+                cm_slm_block_write(slm_t, slot + SLOT_BYTES / 2, t.select<TILE / 2, 1>(TILE / 2));
+            }
+        }
+    }
+    cm_fence(CM_LOCAL_BARRIER);
+    cm_barrier();
+
+    // ------------------------------------------------------------------
+    // Phase 3: up projection + sigmoid read gate + branch mix, 16 channels per pass.
+    // ------------------------------------------------------------------
+    constexpr uint l_bytes = L * (uint)sizeof(half);
+    lsc::block_2d_desc<uint, 1, QSA_REG_N, QSA_REG_K / 2> desc_w(reinterpret_cast<uint*>(const_cast<half*>(w_up)),
+                                                                 CD - 1,
+                                                                 l_bytes - 1,
+                                                                 l_bytes - 1,
+                                                                 0,
+                                                                 0);
+    lsc::block_2d_desc<half, 1, TML, QSA_REG_N> desc_r(const_cast<half*>(residual), num_rows - 1, cd_bytes - 1, cd_bytes - 1, 0, 0);
+    for (uint dt = z * WG + tid; dt < D / QSA_REG_N; dt += nz * WG) {
+        const uint d0 = dt * QSA_REG_N;
+        matrix<float, MT, TILE> mix = 0.0f;
+        for (uint c = 0; c < C; c++) {
+            matrix<float, MT, TILE> acc = 0.0f;
+            desc_w.set_block_y(c * D + d0);
+            for (uint kb = 0; kb < KB; kb++) {
+                vector<uint, TILE> b;
+                cm_load<lsc::Transpose>(b, desc_w.set_block_x(kb * QSA_REG_K / 2));
+#pragma unroll
+                for (uint m = 0; m < MT; m++) {
+                    vector<half, TILE> a;
+                    const uint slot = (m * KB + kb) * SLOT_BYTES;
+                    cm_slm_block_read(slm_t, slot, a.select<TILE / 2, 1>(0));
+                    cm_slm_block_read(slm_t, slot + SLOT_BYTES / 2, a.select<TILE / 2, 1>(TILE / 2));
+                    acc.row(m) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, QSA_SYSTOLIC_DEPTH, 8, float>(acc.row(m), b.format<int32_t>(), a.format<int32_t>());
+                }
+            }
+
+            vector<float, TM> inv;
+            cm_slm_block_read(slm_inv, c * TM * (uint)sizeof(float), inv);
+            vector<float, 16> gain = qsa_gr::load_h16(norm_weight, c * D + d0);
+#if GR_NORM_GAIN_PLUS_ONE
+            gain = gain + 1.0f;
+#endif
+            matrix<half, NL, TML * QSA_REG_N> rt;
+            desc_r.set_block_x(c * D + d0);
+#pragma unroll
+            for (uint i = 0; i < NL; i++) {
+                cm_load<lsc::Normal>(rt.row(i), desc_r.set_block_y(t0 + i * TML));
+            }
+            const vector<float, TILE> gain_rep = gain.replicate<8>();
+#pragma unroll
+            for (uint m = 0; m < MT; m++) {
+                vector<float, TILE> rbar = rt.row((m * 8) / TML).select<TILE, 1>(((m * 8) % TML) * QSA_REG_N);
+                const vector<float, 8> inv8 = inv.select<8, 1>(m * 8);
+                vector<float, TILE> inv_rep;
+#pragma unroll
+                for (uint r = 0; r < 8; r++) {
+                    inv_rep.select<16, 1>(r * 16) = inv8[r];
+                }
+                rbar = rbar * gain_rep * inv_rep;
+                mix.row(m) += qsa_gr::sigmoid<TILE>(acc.row(m)) * rbar;
+            }
+        }
+#pragma unroll
+        for (uint m = 0; m < MT; m++) {
+            vector<half, TILE> o = mix.row(m) * (1.0f / (float)C);
+#pragma unroll
+            for (uint r = 0; r < 8; r++) {
+                const uint tok = t0 + m * 8 + r;
+                if (tok < num_rows) {
+                    qsa_gr::store_h16(mixed, tok * D + d0, o.select<16, 1>(r * 16));
+                }
+            }
+        }
+    }
+}
+
+### Block: task.py ###
+KERNEL_NAME = "gr_read_dpas"
+C, D, L = 4, 2560, 320
+CD = C * D
+EPS = 1e-6
+# Same options the OpenVINO plugin uses for the gated_residual kernels.
+BUILD_OPTIONS = "-cmc -Qxcm_register_file_size=256"
+
+WG = 16  # gr_wg_size
+TM = 32  # gr_read_dpas_tm: token rows per work-group
+NT = 2  # low-rank 16-wide tiles per phase-2 task
+
+SENTINEL = 7.0  # pre-fill of the outputs, to detect rows the kernel failed to write
+PAD_ROWS = 64  # extra sentinel rows behind the outputs, to detect out-of-range writes
+
+TOKENS = [2048, 4096, 8192, 32768, 65536]
+CORRECTNESS_ROWS = [1, 7, 32, 33, 100, 1025]
+
+
+def build_kernel(filename: str):
+    """JIT-compile kernel.cm / reference.cm. Dispatch-relevant macros are pinned here, not in the kernel."""
+    defines = dict(
+        KERNEL_NAME=KERNEL_NAME,
+        GR_BRANCHES=C,
+        GR_HIDDEN=D,
+        GR_LOWRANK=L,
+        GR_EPS=EPS,
+        GR_NORM_GAIN_PLUS_ONE=1,
+        GR_PRODUCE_WRITE_GATE=1,
+        GR_WG_SIZE=WG,
+        GR_RD_TM=TM,
+        GR_RD_NT=NT,
+    )
+    header = "".join(f"#define {k} {v}\n" for k, v in defines.items())
+    return cl.kernels(header + (CWD / filename).read_text(), BUILD_OPTIONS)
+
+
+@pytest.fixture(scope="session")
+def kernel(use_reference):
+    """Compiled handle: reference.cm if use_reference else kernel.cm."""
+    return build_kernel("reference.cm" if use_reference else "kernel.cm")
+
+
+class Weights:
+    """Model weights (fp16) shared by all cases; scales keep t / gates in a realistic range."""
+
+    def __init__(self, seed=0):
+        rng = np.random.default_rng(seed)
+
+        def make(shape, std):
+            return (rng.standard_normal(shape, dtype=np.float32) * std).astype(np.float16)
+
+        self.norm_weight = make((CD,), 0.1)  # stored as w, effective gain = 1 + w
+        self.w_down = make((L, CD), 0.02)
+        self.w_up = make((CD, L), 0.1)
+        self.w_inject = make((C, CD), 0.02)
+        self.t_norm_weight = cl.tensor(self.norm_weight)
+        self.t_w_down = cl.tensor(self.w_down.reshape(-1))
+        self.t_w_up = cl.tensor(self.w_up.reshape(-1))
+        self.t_w_inject = cl.tensor(self.w_inject.reshape(-1))
+
+
+_WEIGHTS = None
+
+
+def weights() -> Weights:
+    global _WEIGHTS
+    if _WEIGHTS is None:
+        _WEIGHTS = Weights()
+    return _WEIGHTS
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+class Case:
+    """One problem: residual [rows, C*D] fp16 plus sentinel-filled outputs."""
+
+    def __init__(self, rows: int, seed: int = 0, tile_rows: int | None = None):
+        self.rows = rows
+        self.w = weights()
+        rng = np.random.default_rng(seed)
+        if tile_rows is None:
+            res = rng.standard_normal((rows, CD), dtype=np.float32)
+            # per-row magnitude spread exercises the RMSNorm
+            res *= np.exp(rng.uniform(-1.5, 1.5, size=(rows, 1))).astype(np.float32)
+            self.residual = res.astype(np.float16)
+        else:  # benchmark inputs: tile a small random block instead of generating GBs of randn
+            base = rng.standard_normal((tile_rows, CD), dtype=np.float32).astype(np.float16)
+            self.residual = np.tile(base, ((rows + tile_rows - 1) // tile_rows, 1))[:rows]
+        self.t_residual = cl.tensor(self.residual.reshape(-1))
+        self._fresh_outputs()
+
+    def _fresh_outputs(self):
+        n = self.rows + PAD_ROWS
+        self.t_mixed = cl.tensor(np.full(n * D, SENTINEL, dtype=np.float16))
+        self.t_gate = cl.tensor(np.full(n * C, SENTINEL, dtype=np.float16))
+
+    def enqueue(self, handle):
+        """Dispatch: gws = [WG, ceil(rows / TM), 1], lws = [WG, 1, 1]."""
+        w = self.w
+        handle.enqueue(KERNEL_NAME, [WG, (self.rows + TM - 1) // TM, 1], [WG, 1, 1],
+                       self.t_residual, w.t_norm_weight, w.t_w_down, w.t_w_up, w.t_w_inject,
+                       self.t_mixed, self.t_gate, int(self.rows))
+
+    def run(self, handle):
+        """Run once on fresh outputs; returns (mixed [rows, D], gate [rows, C]) as fp32 and checks sentinels."""
+        self._fresh_outputs()
+        self.enqueue(handle)
+        cl.finish()
+        mixed = self.t_mixed.numpy().reshape(-1, D)
+        gate = self.t_gate.numpy().reshape(-1, C)
+        assert (mixed[self.rows:] == SENTINEL).all(), "kernel wrote past the last row of `mixed`"
+        assert (gate[self.rows:] == SENTINEL).all(), "kernel wrote past the last row of `write_gate`"
+        return mixed[:self.rows].astype(np.float32), gate[:self.rows].astype(np.float32)
+
+    def reference(self):
+        """FP32 NumPy model of GatedResidual READ with write gate (inputs are the fp16 values)."""
+        w = self.w
+        r = self.residual.astype(np.float32).reshape(self.rows, C, D)
+        gain = 1.0 + w.norm_weight.astype(np.float32).reshape(C, D)
+        inv = 1.0 / np.sqrt((r * r).mean(axis=-1, keepdims=True) + EPS)
+        rbar = r * inv * gain
+        flat = rbar.reshape(self.rows, CD)
+        x = flat @ w.w_down.astype(np.float32).T / C
+        t = x * _sigmoid(x)
+        g = _sigmoid(t @ w.w_up.astype(np.float32).T).reshape(self.rows, C, D)
+        mixed = (g * rbar).sum(axis=1) / C
+        gate = 2.0 * _sigmoid(flat @ w.w_inject.astype(np.float32).T / C)
+        return mixed, gate
+
+
+class TestGatedResidualReadDpas(TestBase):
+    """Custom task for the Qwen4 Gated Residual READ single-kernel DPAS implementation."""
+
+    @pytest.mark.parametrize("rows", CORRECTNESS_ROWS)
+    def test_correctness_wrt_numpy(self, kernel, rows):
+        """Merged stream and write gate must match the FP32 NumPy model."""
+        case = Case(rows, seed=rows)
+        mixed, gate = case.run(kernel)
+        exp_mixed, exp_gate = case.reference()
+        np.testing.assert_allclose(mixed, exp_mixed, rtol=2e-2, atol=5e-3, err_msg=f"mixed, rows={rows}")
+        np.testing.assert_allclose(gate, exp_gate, rtol=1e-2, atol=5e-3, err_msg=f"write_gate, rows={rows}")
+
+    @pytest.mark.parametrize("rows", [33, 2048])
+    def test_correctness_wrt_reference(self, kernel, use_reference, rows):
+        """Optimized kernel output must match reference.cm on the same inputs."""
+        if use_reference:
+            pytest.skip("Skipping reference-vs-reference comparison.")
+        case = Case(rows, seed=123)
+        mixed, gate = case.run(kernel)
+        ref_mixed, ref_gate = case.run(build_kernel("reference.cm"))
+        np.testing.assert_allclose(mixed, ref_mixed, rtol=1e-2, atol=2e-3)
+        np.testing.assert_allclose(gate, ref_gate, rtol=1e-2, atol=2e-3)
+
+    @pytest.mark.performance
+    @pytest.mark.parametrize("tokens", TOKENS)
+    def test_benchmark(self, kernel, measure_runtime, tokens):
+        """Benchmark: time only the kernel dispatch (no host<->device copies)."""
+        case = Case(tokens, seed=tokens, tile_rows=2048)
+
+        def run():
+            case.enqueue(kernel)
+
+        measure_runtime(run, sync_fn=cl.finish, auto_replicate_inputs_size=0)
+
+// [EVOLVE_END]

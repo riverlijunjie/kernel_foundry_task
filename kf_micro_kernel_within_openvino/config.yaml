@@ -1,0 +1,66 @@
+task_name: openvino_gr_up_micro
+job_name: openvino_gr_up_micro_test
+
+gpu_arch: ptl
+language: OCL
+
+use_container: true
+# Without container_image the worker builds environment/Dockerfile on the fly (a full OpenVINO build, hours on a cold cache).
+# Preferred: build it once, push it to the registry and set container_image to that image.
+# container_image: "amr-registry.caas.intel.com/caisp-team/kernelfoundry/openvino-gr-up-micro:v1"
+environment_build_timeout: 14400
+
+use_cached_reference: false
+test_timeout: 2000
+build_timeout: 10000
+build_output_inactivity_timeout: 1800
+test_output_inactivity_timeout: 900
+
+profiler_kernel: vtune
+profiler_reference: vtune
+
+test_reference: true # run tests + profiling for the reference too, to compute speedup
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-5-5-opus
+    temperature: 0.3
+    max_tokens: 8000
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 2
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 6
+
+max_iters: 8
+branches_per_iteration: 6
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+# Fine-tune gradient computation (optional)
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate  # mutate/intensify/diversify
+use_exploration_prompts: True
+

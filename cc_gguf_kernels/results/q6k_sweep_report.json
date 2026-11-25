@@ -1,0 +1,266 @@
+{
+  "device": "Intel(R) Arc(TM) B390 GPU",
+  "hw": {
+    "name": "Intel Arc B390 GPU (Panther Lake / Xe3)",
+    "compute_units": 96,
+    "max_clock_ghz": 2.4,
+    "fp32_tflops": 7.37,
+    "int8_tops_dp4a": 29.49,
+    "peak_bw_gbps": 110.0,
+    "l2_cache_MiB": 16.0
+  },
+  "bench": {
+    "iters": 30,
+    "warmup": 10,
+    "flush_l2": true
+  },
+  "flush_mib": 128,
+  "timestamp_unix": 1783475149,
+  "records": [
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 1
+      },
+      "timing": {
+        "median_ms": 6.178541000000001,
+        "min_ms": 6.136979000000001,
+        "mean_ms": 6.187964900000001,
+        "max_ms": 6.323437,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 6.178541000000001,
+        "achieved_gflops": 164.62118160258223,
+        "achieved_bw_gbps": 67.60116085658409,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 61.455600778712814,
+        "compute_util_pct": 0.5582044189540685,
+        "roofline_pct": 61.455600778712814,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 6.1543225,
+        "min_ms": 6.125625,
+        "mean_ms": 6.246541233333334,
+        "max_ms": 7.567395,
+        "iters": 30
+      }
+    },
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 2
+      },
+      "timing": {
+        "median_ms": 3.101354,
+        "min_ms": 3.0801040000000004,
+        "mean_ms": 3.1227878333333337,
+        "max_ms": 3.6381250000000005,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 3.101354,
+        "achieved_gflops": 327.95956862712217,
+        "achieved_bw_gbps": 134.67554622916313,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 122.43231475378465,
+        "compute_util_pct": 1.1120590841577225,
+        "roofline_pct": 122.43231475378465,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 3.1047390000000004,
+        "min_ms": 3.0816660000000002,
+        "mean_ms": 3.1062737333333335,
+        "max_ms": 3.159895,
+        "iters": 30
+      }
+    },
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 4
+      },
+      "timing": {
+        "median_ms": 1.5668225,
+        "min_ms": 1.554062,
+        "mean_ms": 1.5672357000000001,
+        "max_ms": 1.580416,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 1.5668225,
+        "achieved_gflops": 649.1601441771484,
+        "achieved_bw_gbps": 266.5755336038383,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 242.3413941853076,
+        "compute_util_pct": 2.2011994906180434,
+        "roofline_pct": 242.34139418530756,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 1.5788535000000001,
+        "min_ms": 1.5543750000000003,
+        "mean_ms": 1.5782149,
+        "max_ms": 1.6037500000000002,
+        "iters": 30
+      }
+    },
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 8
+      },
+      "timing": {
+        "median_ms": 0.8135935,
+        "min_ms": 0.795208,
+        "mean_ms": 0.8164440333333334,
+        "max_ms": 0.846145,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 0.8135935,
+        "achieved_gflops": 1250.1559070961114,
+        "achieved_bw_gbps": 513.3725183399326,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 466.70228939993876,
+        "compute_util_pct": 4.2390811736928695,
+        "roofline_pct": 466.70228939993876,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 0.815416,
+        "min_ms": 0.8004160000000001,
+        "mean_ms": 0.8160481666666667,
+        "max_ms": 0.836979,
+        "iters": 30
+      }
+    },
+    {
+      "kernel": "fc_gguf_dp4a(+prequant)",
+      "format": "gguf_q6_k",
+      "params": {
+        "K": 2048,
+        "N": 248320,
+        "M": 1,
+        "out_dt": "f16",
+        "NROW": 16
+      },
+      "timing": {
+        "median_ms": 0.4307285,
+        "min_ms": 0.41937500000000005,
+        "mean_ms": 0.4332947333333334,
+        "max_ms": 0.45572900000000005,
+        "iters": 30
+      },
+      "roofline": {
+        "time_ms": 0.4307285,
+        "achieved_gflops": 2361.391735164959,
+        "achieved_bw_gbps": 969.6979512616416,
+        "arithmetic_intensity": 2.4351827619029525,
+        "peak_compute_gflops": 29491.199999999997,
+        "peak_bw_gbps": 110.0,
+        "attainable_gflops": 267.87010380932475,
+        "bw_util_pct": 881.5435920560378,
+        "compute_util_pct": 8.007106306847328,
+        "roofline_pct": 881.5435920560378,
+        "bound_by": "memory"
+      },
+      "correctness": {
+        "rel_l2_err": 0.00020748994752440732,
+        "cosine": 0.9999999784831448,
+        "prequant_q_match": 1.0,
+        "prequant_scale_rel": 2.361141156024935e-08,
+        "passed": true
+      },
+      "data": {
+        "weight_MiB": 397.8515625,
+        "bytes_moved_MiB": 398.327392578125
+      },
+      "timing_full_path": {
+        "median_ms": 0.4345305,
+        "min_ms": 0.42125,
+        "mean_ms": 0.4346315,
+        "max_ms": 0.45041600000000004,
+        "iters": 30
+      }
+    }
+  ]
+}

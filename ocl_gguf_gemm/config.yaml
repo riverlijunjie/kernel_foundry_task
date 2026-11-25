@@ -1,0 +1,50 @@
+task_name: fc_gguf_gemm # OCL dpas GGUF prefill GEMM (Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0)
+job_name: fc_gguf_gemm_K4096_N4096 # A name for the job / run
+
+gpu_arch: ptl # Panther Lake / Xe3
+language: OCL # The target language
+
+test_reference: true # run tests + profiling for the reference too, to compute speedup
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-5-5-opus
+    temperature: 0.25
+    max_tokens: 8000
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 4
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+
+database:
+  config:
+    exploration_ratio: 0.25
+    num_top_programs: 6
+
+max_iters: 8
+branches_per_iteration: 6
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+# Fine-tune gradient computation (optional)
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate  # mutate/intensify/diversify
+use_exploration_prompts: True

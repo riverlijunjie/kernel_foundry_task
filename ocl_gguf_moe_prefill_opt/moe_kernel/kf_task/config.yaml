@@ -1,0 +1,52 @@
+task_name: moe_gguf_transcode # GGUF MoE weight transcode (prefill / compute-bound path, token > 32)
+job_name: moe_gguf_transcode_prefill_E256 # A name for the job / run
+
+gpu_arch: ptl # Panther Lake / Xe3 (Arc B390) — matches the sibling moe_kernel tasks
+language: OCL # The target language
+
+test_reference: true # run tests + profiling for the reference too, to compute speedup
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-4-8-opus
+    temperature: 0.1
+    max_tokens: 5000
+
+prompt:
+  reference_language: OCL
+  num_optimization_tips: 2
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+
+max_iters: 12
+branches_per_iteration: 8
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+# Fine-tune gradient computation (optional)
+gradient_config:
+  max_history: 10000          # Transitions to remember
+  max_cell_cache: 256         # Cell statistics cache size
+  fitness_weight: 0.4         # Weight for fitness gradient
+  improvement_rate_weight: 0.4 # Weight for improvement rate
+  exploration_weight: 0.2     # Weight for exploring empty cells
+  checkpoint_interval: 100    # Save gradient data every N transitions
+
+# 优化感知 Prompting
+use_optimization_aware_prompting: True
+exploration_strategy: mutate  # mutate/intensify/diversify
+use_exploration_prompts: True

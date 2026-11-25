@@ -1,0 +1,10 @@
+task_name: gemm_ocl # name for operation
+job_name: test_gemm_ocl_template # A name for the job, e.g., experiment name or model name
+
+gpu_arch: ptl # Short name of the target architecture
+language: OCL # The target language
+
+prompt:
+  reference_language: OCL
+
+test_reference: true # If true will run the tests and profiling for the reference too

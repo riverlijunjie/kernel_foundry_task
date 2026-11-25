@@ -1,0 +1,212 @@
+/*
+ * gemv_q4k_sg.cl  — High-performance Q4_K GEMV with Intel sub-group block reads.
+ *
+ * == Transposed ("SG") weight layout — SAME total size as original ==
+ *
+ * Original (row-major) layout:
+ *   pqs[total_blk * 128]   psl[total_blk * 16]
+ *   where total_blk = N * K / 256
+ *
+ *   For block blk = row * nbpr + bid:
+ *     pqs[blk*128 .. blk*128+127]  -- 8 sub-blocks × 16 bytes
+ *     psl[blk*16  .. blk*16+15]    -- sl(4B) ml(4B) sh(2B) mh(2B) d(2B) dmin(2B)
+ *
+ * Transposed layout (produced by pack_q4k_sg in the test):
+ *   Group rows by OPG=16. For row-group h and K-block bid the OPG blocks are
+ *   interleaved in 4-byte chunks so a single sub-group block read delivers
+ *   4 contiguous weight bytes to each of the 16 lanes.
+ *
+ * pqs_T:  total_blk * 128 bytes
+ *   Entry (h, bid) at byte offset (h*nbpr + bid) * OPG * 128   (2048 B)
+ *   Sub-block j at j*OPG*16, chunk c (0..3) at j*OPG*16 + c*OPG*4.
+ *   Lane lid gets original pqs[blk*128 + j*16 + c*4 .. +3],
+ *   blk = (h*OPG + lid)*nbpr + bid.
+ *
+ * psl_T:  total_blk * 16 bytes
+ *   Entry (h, bid) at (h*nbpr + bid) * OPG * 16  (256 B), SoA fields:
+ *     [ sl_u32×OPG=64B | ml_u32×OPG=64B | sh_u16×OPG=32B |
+ *       mh_u16×OPG=32B | d_u16×OPG=32B  | dmin_u16×OPG=32B ]
+ *
+ * == Optimization notes ==
+ *   * Weights are read with wide intel_sub_group_block_read8 (512 B/call):
+ *     the whole 2048-byte entry is fetched with 4 calls, maximizing the number
+ *     of in-flight loads so the memory-bound kernel keeps the DRAM pipe full.
+ *   * All long-latency global loads for a block (4×weight + 6×scale) are issued
+ *     BEFORE the SLM input barrier, so they overlap the barrier and the scalar
+ *     decode/reduction work — good memory-level parallelism at low occupancy.
+ *   * The per-block quantized scale/min are factored OUT of the inner loop.
+ *     For sub-block j (32 weights, low+high nibbles) we compute
+ *         dot_j  = Σ input_k * qnibble_k
+ *         isum_j = Σ input_k                         (weight-independent)
+ *     and combine once as  acc += scale_j*dot_j - min_j*isum_j.
+ *     This halves the FMA count and removes per-weight peripheral ops.
+ *   * The bid loop is NOT fully unrolled (avoids register spills for large K);
+ *     only the tight per-block work is unrolled.
+ *
+ * == Dispatch ==
+ *   global = output_len   local = OPG = 16 (one sub-group per work-group)
+ *   h  = get_group_id(0)   hh = get_local_id(0)  (= output row within group)
+ */
+
+#pragma OPENCL EXTENSION cl_khr_fp16        : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+
+#define OPG 16  /* = sub_group_size */
+
+#define unroll_for __attribute__((opencl_unroll_hint)) for
+
+/* Accumulate one 4-byte chunk (8 quantized weights: 4 low + 4 high nibbles)
+ * into the sub-block dot product.  `in` points at slm_inp + j*32, `c` is the
+ * chunk index (0..3). Low nibbles map to in[c*4 + b], high to in[16 + c*4 + b]. */
+#define ACC_CHUNK(dot, u, c, in)                                             \
+    do {                                                                     \
+        uint _w = (u);                                                       \
+        (dot) = fma((in)[(c)*4 + 0],      (float)( _w        & 0xFu), (dot)); \
+        (dot) = fma((in)[(c)*4 + 1],      (float)((_w >>  8) & 0xFu), (dot)); \
+        (dot) = fma((in)[(c)*4 + 2],      (float)((_w >> 16) & 0xFu), (dot)); \
+        (dot) = fma((in)[(c)*4 + 3],      (float)((_w >> 24) & 0xFu), (dot)); \
+        (dot) = fma((in)[16 + (c)*4 + 0], (float)((_w >>  4) & 0xFu), (dot)); \
+        (dot) = fma((in)[16 + (c)*4 + 1], (float)((_w >> 12) & 0xFu), (dot)); \
+        (dot) = fma((in)[16 + (c)*4 + 2], (float)((_w >> 20) & 0xFu), (dot)); \
+        (dot) = fma((in)[16 + (c)*4 + 3], (float)((_w >> 28) & 0xFu), (dot)); \
+    } while (0)
+
+/* -----------------------------------------------------------------------
+ * gemv_q4k_sg
+ * ----------------------------------------------------------------------- */
+__attribute__((intel_reqd_sub_group_size(OPG)))
+__kernel void gemv_q4k_sg(
+    __global const half   * restrict inputs,   /* [input_len]              */
+    __global const uchar  * restrict pqs_T,    /* [total_blk * OPG * 128]  */
+    __global const uchar  * restrict psl_T,    /* [total_blk * OPG * 16]   */
+    __global       half   * restrict outputs,  /* [output_len]             */
+    uint input_len,
+    uint output_len
+) {
+    const uint nbpr = input_len / 256;
+
+    const uint h  = get_group_id(0);    /* row-group  */
+    const uint hh = get_local_id(0);    /* lane = output row within group */
+
+    /* 256 activations (expanded to float) shared by all OPG rows of the group */
+    __local float slm_inp[256];
+
+    const __global uint    *pqs_u  = (const __global uint    *)pqs_T;
+    const __global uint    *psl_pu = (const __global uint    *)psl_T;
+    const __global ushort  *psl_us = (const __global ushort  *)psl_T;
+
+    float acc = 0.0f;
+
+    for (uint bid = 0; bid < nbpr; bid++) {
+
+        /* =============================================================== *
+         * Issue all long-latency global loads first (weights + scales),   *
+         * so they are in flight while we sync/decode the activations.     *
+         * =============================================================== */
+        uint pe_u = (h * nbpr + bid) * (OPG * 128 / 4);   /* uints */
+        uint8 w0 = intel_sub_group_block_read8(pqs_u + pe_u +   0);  /* sub 0,1 */
+        uint8 w1 = intel_sub_group_block_read8(pqs_u + pe_u + 128);  /* sub 2,3 */
+        uint8 w2 = intel_sub_group_block_read8(pqs_u + pe_u + 256);  /* sub 4,5 */
+        uint8 w3 = intel_sub_group_block_read8(pqs_u + pe_u + 384);  /* sub 6,7 */
+
+        uint   psl_pu_off = (h * nbpr + bid) * (OPG * 16 / 4);   /* uints  */
+        uint   psl_us_off = (h * nbpr + bid) * (OPG * 16 / 2);   /* ushort */
+        uint   sl     = intel_sub_group_block_read   (psl_pu + psl_pu_off +  0);
+        uint   ml     = intel_sub_group_block_read   (psl_pu + psl_pu_off + 16);
+        ushort sh     = intel_sub_group_block_read_us(psl_us + psl_us_off + 64);
+        ushort mh     = intel_sub_group_block_read_us(psl_us + psl_us_off + 80);
+        ushort d_raw  = intel_sub_group_block_read_us(psl_us + psl_us_off + 96);
+        ushort dn_raw = intel_sub_group_block_read_us(psl_us + psl_us_off + 112);
+
+        /* ---- Load 256 activations into SLM with ONE wide block read ---- *
+         * 256 halves = 128 uints; block_read8 delivers 8 uints/lane = 128. *
+         * Lane hh gets inp_u[n*OPG + hh]; store to same index → identity.  */
+        {
+            const __global uint *inp_u = (const __global uint *)(inputs + bid * 256);
+            uint8 iv = intel_sub_group_block_read8(inp_u);
+            half2 t;
+            t = as_half2(iv.s0); slm_inp[(0*OPG + hh)*2 + 0] = t.s0; slm_inp[(0*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s1); slm_inp[(1*OPG + hh)*2 + 0] = t.s0; slm_inp[(1*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s2); slm_inp[(2*OPG + hh)*2 + 0] = t.s0; slm_inp[(2*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s3); slm_inp[(3*OPG + hh)*2 + 0] = t.s0; slm_inp[(3*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s4); slm_inp[(4*OPG + hh)*2 + 0] = t.s0; slm_inp[(4*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s5); slm_inp[(5*OPG + hh)*2 + 0] = t.s0; slm_inp[(5*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s6); slm_inp[(6*OPG + hh)*2 + 0] = t.s0; slm_inp[(6*OPG + hh)*2 + 1] = t.s1;
+            t = as_half2(iv.s7); slm_inp[(7*OPG + hh)*2 + 0] = t.s0; slm_inp[(7*OPG + hh)*2 + 1] = t.s1;
+        }
+
+        /* ---- Decode 8 (scale, min) pairs (overlaps outstanding loads) ---- */
+        float scale[8], minv[8];
+        {
+            float d    = (float)as_half(d_raw);
+            float dmin = (float)as_half(dn_raw);
+            unroll_for (int i = 0; i < 8; i++) {
+                uint sq = ((sl >> (i * 4)) & 0xFu) | ((uint)((sh >> (i * 2)) & 0x3u) << 4);
+                uint mq = ((ml >> (i * 4)) & 0xFu) | ((uint)((mh >> (i * 2)) & 0x3u) << 4);
+                scale[i] = (float)sq * d;
+                minv[i]  = (float)mq * dmin;
+            }
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        /* ---- Per-sub-block activation sums (weight independent) ---- */
+        float isum[8];
+        unroll_for (int j = 0; j < 8; j++) {
+            float s = 0.0f;
+            unroll_for (int i = 0; i < 32; i++)
+                s += slm_inp[j * 32 + i];
+            isum[j] = s;
+        }
+
+        /* ---- Dot products + factored scale/min combine ---- */
+        float dot;
+        __local const float *in;
+
+        in = slm_inp + 0*32; dot = 0.0f;
+        ACC_CHUNK(dot, w0.s0, 0, in); ACC_CHUNK(dot, w0.s1, 1, in);
+        ACC_CHUNK(dot, w0.s2, 2, in); ACC_CHUNK(dot, w0.s3, 3, in);
+        acc = fma(scale[0], dot, acc); acc = fma(-minv[0], isum[0], acc);
+
+        in = slm_inp + 1*32; dot = 0.0f;
+        ACC_CHUNK(dot, w0.s4, 0, in); ACC_CHUNK(dot, w0.s5, 1, in);
+        ACC_CHUNK(dot, w0.s6, 2, in); ACC_CHUNK(dot, w0.s7, 3, in);
+        acc = fma(scale[1], dot, acc); acc = fma(-minv[1], isum[1], acc);
+
+        in = slm_inp + 2*32; dot = 0.0f;
+        ACC_CHUNK(dot, w1.s0, 0, in); ACC_CHUNK(dot, w1.s1, 1, in);
+        ACC_CHUNK(dot, w1.s2, 2, in); ACC_CHUNK(dot, w1.s3, 3, in);
+        acc = fma(scale[2], dot, acc); acc = fma(-minv[2], isum[2], acc);
+
+        in = slm_inp + 3*32; dot = 0.0f;
+        ACC_CHUNK(dot, w1.s4, 0, in); ACC_CHUNK(dot, w1.s5, 1, in);
+        ACC_CHUNK(dot, w1.s6, 2, in); ACC_CHUNK(dot, w1.s7, 3, in);
+        acc = fma(scale[3], dot, acc); acc = fma(-minv[3], isum[3], acc);
+
+        in = slm_inp + 4*32; dot = 0.0f;
+        ACC_CHUNK(dot, w2.s0, 0, in); ACC_CHUNK(dot, w2.s1, 1, in);
+        ACC_CHUNK(dot, w2.s2, 2, in); ACC_CHUNK(dot, w2.s3, 3, in);
+        acc = fma(scale[4], dot, acc); acc = fma(-minv[4], isum[4], acc);
+
+        in = slm_inp + 5*32; dot = 0.0f;
+        ACC_CHUNK(dot, w2.s4, 0, in); ACC_CHUNK(dot, w2.s5, 1, in);
+        ACC_CHUNK(dot, w2.s6, 2, in); ACC_CHUNK(dot, w2.s7, 3, in);
+        acc = fma(scale[5], dot, acc); acc = fma(-minv[5], isum[5], acc);
+
+        in = slm_inp + 6*32; dot = 0.0f;
+        ACC_CHUNK(dot, w3.s0, 0, in); ACC_CHUNK(dot, w3.s1, 1, in);
+        ACC_CHUNK(dot, w3.s2, 2, in); ACC_CHUNK(dot, w3.s3, 3, in);
+        acc = fma(scale[6], dot, acc); acc = fma(-minv[6], isum[6], acc);
+
+        in = slm_inp + 7*32; dot = 0.0f;
+        ACC_CHUNK(dot, w3.s4, 0, in); ACC_CHUNK(dot, w3.s5, 1, in);
+        ACC_CHUNK(dot, w3.s6, 2, in); ACC_CHUNK(dot, w3.s7, 3, in);
+        acc = fma(scale[7], dot, acc); acc = fma(-minv[7], isum[7], acc);
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    uint row = h * OPG + hh;
+    if (row < output_len)
+        outputs[row] = convert_half_rte(acc);
+}

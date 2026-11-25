@@ -1,0 +1,175 @@
+/*
+ * gemv_q4k_sg.cl  — High-performance Q4_K GEMV with Intel sub-group block reads.
+ *
+ * == Transposed ("SG") weight layout — SAME total size as original ==
+ *
+ * Original (row-major) layout:
+ *   pqs[total_blk * 128]   psl[total_blk * 16]
+ *   where total_blk = N * K / 256
+ *
+ *   For block blk = row * nbpr + bid:
+ *     pqs[blk*128 .. blk*128+127]  -- 8 sub-blocks × 16 bytes
+ *     psl[blk*16  .. blk*16+15]    -- sl(4B) ml(4B) sh(2B) mh(2B) d(2B) dmin(2B)
+ *
+ * Problem: with OPG work-items each owning a different output row,
+ *   lane `lid` reads pqs[(h*OPG+lid)*nbpr+bid * 128] → stride = nbpr*128 bytes.
+ *   That is scatter access, not coalesced.
+ *
+ * Transposed layout:
+ *   Group rows by OPG=16. For row-group h (rows h*OPG .. h*OPG+OPG-1) and K-block bid,
+ *   pack the OPG blocks' data in interleaved 4-byte chunks so that
+ *   intel_sub_group_block_read_uc4 delivers 4 bytes to each of the 16 lanes at once.
+ *
+ * pqs_T:  same total bytes = total_blk * 128
+ *   Entry (h, bid) at byte offset: (h*nbpr + bid) * OPG * 128
+ *   Entry size: OPG * 128 = 2048 bytes   (16 rows × 128 bytes/row)
+ *   Within entry, sub-block j at offset: j * OPG * 16
+ *   Within sub-block j, chunk c (0..3) at offset: j * OPG * 16 + c * OPG * 4
+ *   Lane lid gets: original pqs[blk*128 + j*16 + c*4 .. c*4+3]
+ *                  where blk = (h*OPG + lid) * nbpr + bid
+ *
+ * psl_T:  same total bytes = total_blk * 16
+ *   Entry (h, bid) at byte offset: (h*nbpr + bid) * OPG * 16
+ *   Entry size: OPG * 16 = 256 bytes, SoA fields:
+ *     [ sl_u32×OPG=64B | ml_u32×OPG=64B | sh_u16×OPG=32B |
+ *       mh_u16×OPG=32B | d_u16×OPG=32B  | dmin_u16×OPG=32B ]
+ *   Lane lid's sl at: entry_base + lid*4
+ *   Lane lid's d  at: entry_base + 192 + lid*2
+ *
+ * == Sub-group block read semantics ==
+ *   intel_sub_group_block_read_uc4(ptr):
+ *     Reads 64 contiguous bytes; lane lid gets bytes [lid*4 .. lid*4+3].
+ *   intel_sub_group_block_read(uint_ptr):
+ *     Reads 64 bytes; lane lid gets uint at (uint_ptr + lid).
+ *   intel_sub_group_block_read_us(ushort_ptr):
+ *     Reads 32 bytes; lane lid gets ushort at (ushort_ptr + lid).
+ *
+ * == Dispatch ==
+ *   global = output_len   (one work-item per output row)
+ *   local  = OPG = 16     (one sub-group per work-group)
+ *   h   = get_group_id(0)  -- row-group index
+ *   hh  = get_local_id(0)  -- lane = output row within group
+ */
+
+#pragma OPENCL EXTENSION cl_khr_fp16       : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+
+#define OPG 16  /* = sub_group_size */
+
+inline float _u16_to_half(ushort raw) { return as_half(raw); }
+
+#define _dequant_4bit_to_half(qs, s, m) fma(convert_half(qs), (s), (m))
+#define unroll_for __attribute__((opencl_unroll_hint)) for
+
+/* -----------------------------------------------------------------------
+ * gemv_q4k_sg
+ * ----------------------------------------------------------------------- */
+__attribute__((intel_reqd_sub_group_size(OPG)))
+__kernel void gemv_q4k_sg(
+    __global const half   *inputs,   /* [input_len]              */
+    __global const uchar  *pqs_T,    /* [total_blk * OPG * 128]  same total size as pqs */
+    __global const uchar  *psl_T,    /* [total_blk * OPG * 16]   same total size as psl */
+    __global       half   *outputs,  /* [output_len]             */
+    uint input_len,
+    uint output_len
+) {
+    const uint nbpr = input_len / 256;
+
+    const uint h  = get_group_id(0);    /* row-group  */
+    const uint hh = get_local_id(0);    /* lane = output row within group */
+
+    /* Mixed precision: fp16 IO + fp32 accumulation for numerical stability */
+    __local half slm_inp[256];
+    __local float slm_acc[OPG];
+    slm_acc[hh] = 0.0f;
+
+    unroll_for (uint bid = 0; bid < nbpr; bid++) {
+
+        /* ---- Cooperatively load 256 input half values into SLM ---- */
+        /* All OPG lanes load disjoint slices: lane hh loads elements [k*OPG+hh] for k=0..15 */
+        {
+            const __global ushort *inp_us = (const __global ushort *)(inputs + bid * 256);
+            for (uint k = 0; k < 256 / OPG; k++) {
+                /* intel_sub_group_block_read_us: each lane reads inp_us[k*OPG + hh] */
+                ushort v = intel_sub_group_block_read_us(inp_us + k * OPG);
+                slm_inp[k * OPG + hh] = as_half(v);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        /* ---- Decode scales for block (h, bid) ---- */
+        /* psl_T entry: OPG * 16 = 256 bytes at (h*nbpr+bid)*OPG*16            */
+        /* Fields SoA: sl(64B) ml(64B) sh(32B) mh(32B) d(32B) dmin(32B)        */
+        {
+            uint psl_base = (h * nbpr + bid) * OPG * 16;
+            const __global uint   *psl_u  = (const __global uint   *)(psl_T + psl_base);
+            const __global ushort *psl_us = (const __global ushort *)(psl_T + psl_base);
+
+            uint   sl     = intel_sub_group_block_read   (psl_u  +  0);   /* bytes [  0.. 63] */
+            uint   ml     = intel_sub_group_block_read   (psl_u  + 16);   /* bytes [ 64..127] */
+            ushort sh     = intel_sub_group_block_read_us(psl_us + 64);   /* bytes [128..159] */
+            ushort mh     = intel_sub_group_block_read_us(psl_us + 80);   /* bytes [160..191] */
+            ushort d_raw  = intel_sub_group_block_read_us(psl_us + 96);   /* bytes [192..223] */
+            ushort dn_raw = intel_sub_group_block_read_us(psl_us + 112);  /* bytes [224..255] */
+
+            half d    = _u16_to_half(d_raw);
+            half dmin = _u16_to_half(dn_raw);
+
+            /* Decode 8 scale/min values (same bit logic as SYCL kernel) */
+            half scale[8], minv[8];
+            unroll_for (int i = 0; i < 8; i++) {
+                uint sq  = ((sl >> (i * 4)) & 0xFu)
+                         | ((uint)((sh >> (i * 2)) & 0x3u) << 4);
+                uint mq  = ((ml >> (i * 4)) & 0xFu)
+                         | ((uint)((mh >> (i * 2)) & 0x3u) << 4);
+                scale[i] = (half)sq * d;
+                minv[i]  = (half)mq * dmin;
+            }
+
+            /* ---- Weight loads + FMA over 8 sub-blocks × 4 chunks ---- */
+            /* pqs_T entry: OPG * 128 = 2048 bytes at (h*nbpr+bid)*OPG*128      */
+            /* Sub-block j at offset j*OPG*16 within entry                      */
+            /* Chunk c    at offset j*OPG*16 + c*OPG*4 within entry             */
+            uint pqs_entry = (h * nbpr + bid) * OPG * 128;
+            half2 _acc2 = (half2)(0.0f);
+            float acc = 0.0f;
+
+            unroll_for (int j = 0; j < 8; j++) {
+                half s = scale[j];
+                half m = minv[j];
+                uint  j_off = pqs_entry + (uint)j * OPG * 16;
+
+                unroll_for (int chunk = 0; chunk < 4; chunk++) {
+                    uint  off = j_off + (uint)chunk * OPG * 4;
+                    /* uint block read: lane hh gets 4 contiguous bytes at off + hh*4 */
+                    uint qcw = intel_sub_group_block_read((const __global uint *)(pqs_T + off));
+
+                    uchar qb0 = (uchar)( qcw        & 0xFFu);
+                    uchar qb1 = (uchar)((qcw >>  8) & 0xFFu);
+                    uchar qb2 = (uchar)((qcw >> 16) & 0xFFu);
+                    uchar qb3 = (uchar)((qcw >> 24) & 0xFFu);
+
+                    uint base = (uint)j * 32u + (uint)chunk * 4u;
+
+                    _acc2.s0 = fma(slm_inp[base +  0], _dequant_4bit_to_half((qb0     ) & 0xFu, s, -m), (half)0.0);
+                    _acc2.s0 = fma(slm_inp[base +  1], _dequant_4bit_to_half((qb1     ) & 0xFu, s, -m), _acc2.s0);
+                    _acc2.s0 = fma(slm_inp[base +  2], _dequant_4bit_to_half((qb2     ) & 0xFu, s, -m), _acc2.s0);
+                    _acc2.s0 = fma(slm_inp[base +  3], _dequant_4bit_to_half((qb3     ) & 0xFu, s, -m), _acc2.s0);
+
+                    _acc2.s1 = fma(slm_inp[base + 16], _dequant_4bit_to_half((qb0 >> 4) & 0xFu, s, -m), (half)0.0);
+                    _acc2.s1 = fma(slm_inp[base + 17], _dequant_4bit_to_half((qb1 >> 4) & 0xFu, s, -m), _acc2.s1);
+                    _acc2.s1 = fma(slm_inp[base + 18], _dequant_4bit_to_half((qb2 >> 4) & 0xFu, s, -m), _acc2.s1);
+                    _acc2.s1 = fma(slm_inp[base + 19], _dequant_4bit_to_half((qb3 >> 4) & 0xFu, s, -m), _acc2.s1);
+                    acc += (float)(_acc2.s0 + _acc2.s1);
+                }
+            }
+
+            slm_acc[hh] += acc;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    uint row = h * OPG + hh;
+    if (row < output_len) {
+        outputs[row] = convert_half_rte(slm_acc[hh]);
+    }
+}

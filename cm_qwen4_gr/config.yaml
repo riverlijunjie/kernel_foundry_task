@@ -1,0 +1,61 @@
+task_name: qwen4_gated_residual_read   # Gated Residual (hyper-connection) READ, single systolic DPAS kernel (gr_read_dpas)
+job_name: qwen4_gr_read_dpas_opt        # name for this optimization run
+
+gpu_arch: ptl                # Short name of the target architecture
+language: CM                 # C for Metal
+
+# CM kernels are compiled JIT by clops via clBuildProgram(-cmc), no AOT build step.
+has_build_step: false
+has_reference_build_step: false
+
+test_reference: true         # also run correctness + benchmark against reference.cm
+
+profiler_kernel: unitrace
+profiler_reference: unitrace
+
+build_timeout: 300
+test_timeout: 1500           # 64K-token benchmark moves ~1.3 GB of residual per launch
+
+inference:
+  servers:
+  - _target_: kernelgen.inference_server.InferenceServer
+    server_type: intel_gnai
+    model_name: claude-5-5-opus
+    temperature: 0.2
+    max_tokens: 30000
+
+prompt:
+  reference_language: CM
+  num_optimization_tips: 5
+  include_hardware_specs: true
+  include_inspirations: true
+  rag: []
+
+# evolve mode
+evolve_mode: true
+# agentic workflow
+agentic_workflow: true
+
+database:
+  config:
+    exploration_ratio: 0.3
+    num_top_programs: 4
+
+max_iters: 5
+branches_per_iteration: 6
+
+# QD Gradient Tracking
+use_gradient_tracking: true
+gradient_sampling_weight: 0.3
+
+gradient_config:
+  max_history: 10000
+  max_cell_cache: 256
+  fitness_weight: 0.4
+  improvement_rate_weight: 0.4
+  exploration_weight: 0.2
+  checkpoint_interval: 100
+
+use_optimization_aware_prompting: True
+exploration_strategy: mutate
+use_exploration_prompts: True

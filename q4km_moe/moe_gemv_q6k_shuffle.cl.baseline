@@ -1,0 +1,326 @@
+/*
+ * moe_gemv_q6k_shuffle.cl
+ *
+ * OpenCL MoE kernels for Q6_K on shuffled weight layout, translated from the
+ * SYCL/ESIMD sources:
+ *   runSparseGemvQ6KL1_xve_impl<OPG, BS>  (gemv_q6k_L1.xve.cpp)  -- adapted below
+ *                                            into a fused up+gate MoE kernel
+ *                                            (group_up_gate_q6k), mirroring the
+ *                                            Q4_K/Q5_K runGroupUpAndGateVecQxKL1_xve
+ *                                            structure, using the same
+ *                                            sub-block dequant/dot primitives as
+ *                                            runSparseGemvQ6KL1_xve_impl.
+ *   runDownMergeQ6KL1_xve_impl<OPG>       (gemv_q6k_L1.xve.cpp)
+ *
+ * Shuffled layout (produced by ShuffleQ6KL1):
+ *   pql  [num_blocks * 128]  -- packed lower nibbles (4 bits per weight)
+ *   pqh  [num_blocks *  64]  -- packed upper 2 bits (4 weights per byte)
+ *   ps   [num_blocks *  16]  -- int8 scales (16 per block)
+ *   pd   [num_blocks *   2]  -- fp16 super-scale d
+ *   expert_size = num_blocks * 210  (128+64+16+2)
+ *
+ * Per shuffled block (256 weights), sub-block j (j=0..7) covers 32 weights:
+ *   ql[j*16+k] packs two weights:
+ *       lower_lo[k] = ql[j*16+k] & 0x0F         (low  half, weights 0..15  of sub-block)
+ *       upper_lo[k] = (ql[j*16+k] >> 4) & 0x0F  (high half, weights 16..31 of sub-block)
+ *   qh stores the upper 2 bits in interleaved column-major form within two 4-byte words:
+ *       qh_word_lo = qh[j*8+0..3] as uint32   (for lower 16 weights)
+ *       qh_word_hi = qh[j*8+4..7] as uint32   (for upper 16 weights)
+ *       shift table (same as SYCL): {0,8,16,24, 2,10,18,26, 4,12,20,28, 6,14,22,30}
+ *       upper_bits[k] = (qh_word >> shift[k]) & 0x03  (for k=0..15)
+ *   Full weight: lower_half[k] = lower_lo[k] | (upper_bits_lo[k] << 4)  -- range 0..63
+ *                upper_half[k] = upper_lo[k] | (upper_bits_hi[k] << 4)
+ *   Dequantized: (weight - 32) * d * scale[2*j]    for lower half
+ *                (weight - 32) * d * scale[2*j+1]  for upper half
+ *
+ * Scales: ps[b*16 .. b*16+15] are int8 (signed) values, one per half-sub-block.
+ * Super-scale: pd[b] is fp16.
+ *
+ * Kernels provided:
+ *   group_up_gate_q6k -- MoE up+gate fused GEMV with SiLU(gate) * up activation
+ *   down_merge_q6k    -- MoE down GEMV with per-expert weighted accumulation
+ */
+
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+/* -----------------------------------------------------------------------
+ * Helpers
+ * --------------------------------------------------------------------- */
+inline float q6k_load_fp16(const __global uchar *p) {
+    ushort u = (ushort)p[0] | ((ushort)p[1] << 8);
+    return (float)as_half(u);
+}
+
+/* The shift table used in the SYCL kernel for qh upper-2-bit extraction.
+ * shift[k] gives the bit offset within a 32-bit word for position k (0..15). */
+inline uint q6k_qh_shift(int k) {
+    /* Pattern: {0,8,16,24, 2,10,18,26, 4,12,20,28, 6,14,22,30} */
+    const uint tbl[16] = {0,8,16,24, 2,10,18,26, 4,12,20,28, 6,14,22,30};
+    return tbl[k];
+}
+
+/* Sub-block dot for Q6_K.
+ *   pql_blk : base of 128-byte ql section for this block
+ *   pqh_blk : base of 64-byte qh section for this block
+ *   ps_blk  : base of 16-byte scale section (int8[16])
+ *   d       : fp16 super-scale (as float)
+ *   j       : sub-block index (0..7)
+ */
+inline float q6k_subblock_dot(const __global uchar *pql_blk,
+                               const __global uchar *pqh_blk,
+                               const __global char  *ps_blk,
+                               float d,
+                               const float *input,
+                               int j)
+{
+    float combined_lo = d * (float)ps_blk[2 * j];
+    float combined_hi = d * (float)ps_blk[2 * j + 1];
+
+    uint qh_lo = (uint)pqh_blk[j*8+0] | ((uint)pqh_blk[j*8+1]<<8)
+               | ((uint)pqh_blk[j*8+2]<<16) | ((uint)pqh_blk[j*8+3]<<24);
+    uint qh_hi = (uint)pqh_blk[j*8+4] | ((uint)pqh_blk[j*8+5]<<8)
+               | ((uint)pqh_blk[j*8+6]<<16) | ((uint)pqh_blk[j*8+7]<<24);
+
+    float acc = 0.0f;
+    for (int k = 0; k < 16; k++) {
+        uchar ql_byte = pql_blk[j * 16 + k];
+        uint  sh = q6k_qh_shift(k);
+
+        /* Lower half: ql low nibble + 2 upper bits from qh_lo */
+        float w0 = (float)((ql_byte & 0x0F) | (((qh_lo >> sh) & 0x03u) << 4));
+        w0 = (w0 - 32.0f) * combined_lo;
+
+        /* Upper half: ql high nibble + 2 upper bits from qh_hi */
+        float w1 = (float)(((ql_byte >> 4) & 0x0F) | (((qh_hi >> sh) & 0x03u) << 4));
+        w1 = (w1 - 32.0f) * combined_hi;
+
+        acc += input[j * 32 + k]      * w0;
+        acc += input[j * 32 + 16 + k] * w1;
+    }
+    return acc;
+}
+
+/* =======================================================================
+ * Kernel 1: group_up_gate_q6k
+ *
+ * MoE fused up+gate GEMV with SiLU activation for Q6_K weights, adapted
+ * from runSparseGemvQ6KL1_xve_impl's sub-block dequant/dot machinery and
+ * restructured to follow the same up/gate/SiLU-fusion shape as
+ * runGroupUpAndGateVecQ4KL1_xve_impl (gemv_q4k_L1.xve.cpp) so all three
+ * quant formats expose an identical MoE gate_up kernel signature.
+ *
+ * For each token t and selected expert v (index = indexes[t, v] or v):
+ *   up_out   = W_up  [index] * x[t]
+ *   gate_out = W_gate[index] * x[t]
+ *   out[t, v] = silu(gate_out) * up_out           silu(x) = x * sigmoid(x)
+ *
+ * OPG (outputs-per-group) and BS (Q6K blocks per thread) are compile-time
+ * #defines below (OPG=8, BS=1).
+ *
+ * Buffer layout:
+ *   ups, gates : [num_experts * expert_size]  (expert_size = num_blocks * 210)
+ *   indexes    : [token_len * aligned_output_num]  (uint32, may be NULL -> identity)
+ *
+ * Launch:
+ *   local_thread = num_blocks_per_row / BS_UG_Q6   (num_blocks_per_row = input_len/256)
+ *   global = (output_len/OPG_UG_Q6 * local_thread, output_num, token_len)
+ *   local  = (local_thread, 1, 1)
+ * ===================================================================== */
+#define OPG_UG_Q6 8
+#define BS_UG_Q6  1
+
+__kernel
+void group_up_gate_q6k(
+    __global const float  *inputs,          /* [token_len * input_len] */
+    __global const uchar  *ups,             /* [num_experts * expert_size] */
+    __global const uchar  *gates,           /* [num_experts * expert_size] */
+    __global const uint   *indexes,         /* [token_len * aligned_output_num] or NULL */
+    __global       float  *outputs,         /* [token_len * output_num * output_len] */
+    uint output_num,
+    uint aligned_output_num,
+    uint token_len,
+    uint input_len,
+    uint output_len
+) {
+    uint num_blocks_per_row = input_len / 256;
+    uint num_blocks         = input_len * output_len / 256;
+    uint expert_size        = num_blocks * 210;  /* Q6K: 128 ql + 64 qh + 16 ps + 2 pd */
+
+    uint local_thread = num_blocks_per_row / BS_UG_Q6;
+
+    uint h  = get_group_id(0);
+    uint hh = get_local_id(0);
+    uint v  = get_group_id(1);
+    uint t  = get_group_id(2);
+
+    uint index = indexes ? indexes[t * aligned_output_num + v] : v;
+
+    __local float slm_up  [64 * OPG_UG_Q6];
+    __local float slm_gate[64 * OPG_UG_Q6];
+
+    float outUp  [OPG_UG_Q6]; for (int l = 0; l < OPG_UG_Q6; l++) outUp[l]   = 0.0f;
+    float outGate[OPG_UG_Q6]; for (int l = 0; l < OPG_UG_Q6; l++) outGate[l] = 0.0f;
+
+    for (uint c = 0; c < BS_UG_Q6; c++) {
+        uint blockIdx = hh * BS_UG_Q6 + c;
+
+        float inp[256];
+        for (int i = 0; i < 256; i++)
+            inp[i] = inputs[t * input_len + 256 * blockIdx + i];
+
+        /* --- up projection --- */
+        {
+            const __global uchar *weights = ups + (size_t)index * expert_size;
+            const __global uchar *pql_w   = weights;
+            const __global uchar *pqh_w   = pql_w + (size_t)num_blocks * 128;
+            const __global char  *ps_w    = (const __global char *)(pqh_w + (size_t)num_blocks * 64);
+            const __global uchar *pd_w    = (const __global uchar *)(ps_w  + (size_t)num_blocks * 16);
+
+            for (int l = 0; l < OPG_UG_Q6; l++) {
+                uint blk_idx = h * OPG_UG_Q6 * num_blocks_per_row + (uint)l * num_blocks_per_row + blockIdx;
+                float d = q6k_load_fp16(pd_w + (size_t)blk_idx * 2);
+                float acc = 0.0f;
+                for (int j = 0; j < 8; j++)
+                    acc += q6k_subblock_dot(pql_w + (size_t)blk_idx * 128, pqh_w + (size_t)blk_idx * 64,
+                                            ps_w + (size_t)blk_idx * 16, d, inp, j);
+                outUp[l] += acc;
+            }
+        }
+
+        /* --- gate projection --- */
+        {
+            const __global uchar *weights = gates + (size_t)index * expert_size;
+            const __global uchar *pql_w   = weights;
+            const __global uchar *pqh_w   = pql_w + (size_t)num_blocks * 128;
+            const __global char  *ps_w    = (const __global char *)(pqh_w + (size_t)num_blocks * 64);
+            const __global uchar *pd_w    = (const __global uchar *)(ps_w  + (size_t)num_blocks * 16);
+
+            for (int l = 0; l < OPG_UG_Q6; l++) {
+                uint blk_idx = h * OPG_UG_Q6 * num_blocks_per_row + (uint)l * num_blocks_per_row + blockIdx;
+                float d = q6k_load_fp16(pd_w + (size_t)blk_idx * 2);
+                float acc = 0.0f;
+                for (int j = 0; j < 8; j++)
+                    acc += q6k_subblock_dot(pql_w + (size_t)blk_idx * 128, pqh_w + (size_t)blk_idx * 64,
+                                            ps_w + (size_t)blk_idx * 16, d, inp, j);
+                outGate[l] += acc;
+            }
+        }
+    }
+
+    for (int l = 0; l < OPG_UG_Q6; l++) {
+        slm_up  [hh * OPG_UG_Q6 + l] = outUp[l];
+        slm_gate[hh * OPG_UG_Q6 + l] = outGate[l];
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (hh == 0) {
+        float accUp  [OPG_UG_Q6]; for (int l = 0; l < OPG_UG_Q6; l++) accUp[l]   = 0.0f;
+        float accGate[OPG_UG_Q6]; for (int l = 0; l < OPG_UG_Q6; l++) accGate[l] = 0.0f;
+        for (uint i = 0; i < local_thread; i++) {
+            for (int l = 0; l < OPG_UG_Q6; l++) {
+                accUp[l]   += slm_up  [i * OPG_UG_Q6 + l];
+                accGate[l] += slm_gate[i * OPG_UG_Q6 + l];
+            }
+        }
+        /* SiLU(gate) * up  ==  sigmoid(gate) * gate * up */
+        for (int l = 0; l < OPG_UG_Q6; l++) {
+            float g       = accGate[l];
+            float sig     = 1.0f / (1.0f + exp(-g));
+            float silu_g  = sig * g;
+            outputs[(size_t)t * output_num * output_len + (size_t)v * output_len + h * OPG_UG_Q6 + l] =
+                silu_g * accUp[l];
+        }
+    }
+}
+
+/* =======================================================================
+ * Kernel 2: down_merge_q6k
+ *
+ * MoE down projection: weighted sum over input_num experts, translated
+ * from runDownMergeQ6KL1_xve_impl<OPG>.
+ *
+ *   out[t] (+)= sum_e efficient[t,e] * ( W_down[index[t,e]] * in[t, e] )
+ *
+ * OPG (outputs-per-group) is a compile-time #define below (OPG=4 matches
+ * the SYCL kernel configuration).
+ *
+ * Launch:
+ *   global = (output_len/OPG_DM6 * num_blocks_per_row, token_len)
+ *   local  = (num_blocks_per_row, 1)
+ * ===================================================================== */
+#define OPG_DM6 4
+
+__kernel
+void down_merge_q6k(
+    __global const float  *inputs,      /* [token_len * input_num * input_len] */
+    __global const uchar  *downs,       /* [num_experts * expert_size], expert_size=num_blocks*210 */
+    __global const uint   *indexes,     /* [token_len * aligned_input_num] or NULL */
+    __global const float  *efficients,  /* [token_len * aligned_input_num] */
+    __global       float  *outputs,     /* [token_len * output_len] */
+    uint input_num,
+    uint aligned_input_num,
+    uint token_len,
+    uint input_len,
+    uint output_len,
+    int  is_acc
+) {
+    uint num_blocks_per_row = input_len / 256;
+    uint num_blocks         = input_len * output_len / 256;
+    uint expert_size        = num_blocks * 210;  /* Q6K: 128+64+16+2 */
+
+    uint h  = get_group_id(0);
+    uint hh = get_local_id(0);
+    uint t  = get_group_id(1);
+
+    __local float slm[64 * OPG_DM6];
+
+    float outData[OPG_DM6]; for (int l = 0; l < OPG_DM6; l++) outData[l] = 0.0f;
+
+    for (int e = 0; e < (int)input_num; e++) {
+        uint  index     = indexes ? indexes[t * aligned_input_num + e] : (uint)e;
+        float efficient = efficients[t * aligned_input_num + e];
+
+        const __global uchar *weights = downs + (size_t)index * expert_size;
+        const __global uchar *pql_w   = weights;
+        const __global uchar *pqh_w   = pql_w + (size_t)num_blocks * 128;
+        const __global char  *ps_w    = (const __global char *)(pqh_w + (size_t)num_blocks * 64);
+        const __global uchar *pd_w    = (const __global uchar *)(ps_w  + (size_t)num_blocks * 16);
+
+        float inp[256];
+        for (int i = 0; i < 256; i++)
+            inp[i] = inputs[(size_t)t * input_num * input_len + (size_t)e * input_len + 256 * hh + i];
+
+        float expertOut[OPG_DM6];
+        for (int l = 0; l < OPG_DM6; l++) {
+            uint blk_idx = h * OPG_DM6 * num_blocks_per_row + (uint)l * num_blocks_per_row + hh;
+            float d = q6k_load_fp16(pd_w + (size_t)blk_idx * 2);
+            float acc = 0.0f;
+            for (int j = 0; j < 8; j++)
+                acc += q6k_subblock_dot(pql_w + (size_t)blk_idx * 128, pqh_w + (size_t)blk_idx * 64,
+                                        ps_w + (size_t)blk_idx * 16, d, inp, j);
+            expertOut[l] = acc;
+        }
+
+        for (int l = 0; l < OPG_DM6; l++)
+            outData[l] += expertOut[l] * efficient;
+    }
+
+    for (int l = 0; l < OPG_DM6; l++)
+        slm[hh * OPG_DM6 + l] = outData[l];
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (hh == 0) {
+        float accOut[OPG_DM6]; for (int l = 0; l < OPG_DM6; l++) accOut[l] = 0.0f;
+        for (uint i = 0; i < num_blocks_per_row; i++)
+            for (int l = 0; l < OPG_DM6; l++)
+                accOut[l] += slm[i * OPG_DM6 + l];
+        if (is_acc) {
+            for (int l = 0; l < OPG_DM6; l++)
+                accOut[l] += outputs[(size_t)t * output_len + h * OPG_DM6 + l];
+        }
+        for (int l = 0; l < OPG_DM6; l++)
+            outputs[(size_t)t * output_len + h * OPG_DM6 + l] = accOut[l];
+    }
+}
